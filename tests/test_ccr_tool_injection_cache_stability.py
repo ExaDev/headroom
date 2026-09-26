@@ -55,13 +55,16 @@ CLIENT_TOOLS = [
 ]
 
 
-def _apply(session_id, *, compressed, provider="anthropic"):
+def _apply(session_id, *, compressed, provider="anthropic", allow_eager=True):
+    """``allow_eager=True`` mirrors what both handlers pass for a request that
+    can actually compress (optimization on, no bypass header)."""
     return apply_session_sticky_ccr_tool(
         provider=provider,
         session_id=session_id,
         request_id="req-1",
         existing_tools=CLIENT_TOOLS,
         has_compressed_content_this_turn=compressed,
+        allow_eager=allow_eager,
     )
 
 
@@ -151,6 +154,7 @@ def test_a_request_with_no_tools_is_not_armed_eagerly(empty):
         request_id="req-1",
         existing_tools=empty,
         has_compressed_content_this_turn=False,
+        allow_eager=True,
     )
     assert injected is False
     assert tools == []
@@ -165,6 +169,7 @@ def test_a_client_provided_tool_still_wins(monkeypatch):
         request_id="req-1",
         existing_tools=client_owned,
         has_compressed_content_this_turn=False,
+        allow_eager=True,
     )
     assert injected is False
     assert _names(tools).count(CCR_TOOL_NAME) == 1
@@ -184,3 +189,14 @@ def test_the_sessionless_path_is_also_stable():
     b, _ = _apply(None, compressed=True)
     assert json.dumps(a) == json.dumps(b)
     assert CCR_TOOL_NAME in _names(a)
+
+
+def test_a_request_that_cannot_compress_is_not_armed():
+    """`--no-optimize` or a bypass header means nothing will ever be compressed.
+
+    Pre-arming there would leave a permanently unredeemable tool in the client's
+    array. The old gate got this for free: no compression meant no injection.
+    """
+    tools, injected = _apply("sess-no-optimize", compressed=False, allow_eager=False)
+    assert injected is False
+    assert CCR_TOOL_NAME not in _names(tools)

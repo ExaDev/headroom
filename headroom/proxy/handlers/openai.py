@@ -4202,6 +4202,9 @@ class OpenAIHandlerMixin:
                     existing_tools=tools,
                     has_compressed_content_this_turn=has_new_compressed_content,
                     history_has_ccr_reference=history_references_ccr_tool(optimized_messages),
+                    # Same rule as the Anthropic handler: only pre-arm the tool
+                    # for a request that can actually compress.
+                    allow_eager=bool(self.config.optimize) and not _bypass,
                 )
                 if ccr_tool_injected:
                     logger.debug(

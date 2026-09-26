@@ -2699,6 +2699,7 @@ def apply_session_sticky_ccr_tool(
     existing_tools: list[dict[str, Any]] | None,
     has_compressed_content_this_turn: bool,
     history_has_ccr_reference: bool = False,
+    allow_eager: bool = False,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Apply sticky-on CCR retrieval-tool injection per :class:`SessionCcrTracker`.
 
@@ -2754,9 +2755,8 @@ def apply_session_sticky_ccr_tool(
     # definition and the provider rejects the request because history still
     # references it (#2440).
     if not session_id:
-        # See the fresh-session branch below: eager injection requires the
-        # client to have sent tools already.
-        eager = bool(tools_out) and get_ccr_tool_injection_mode() == "eager"
+        # See the fresh-session branch below for what gates eager injection.
+        eager = allow_eager and bool(tools_out) and get_ccr_tool_injection_mode() == "eager"
         if not (eager or has_compressed_content_this_turn or history_has_ccr_reference):
             log_tool_injection_decision(
                 provider=provider,
@@ -2838,13 +2838,21 @@ def apply_session_sticky_ccr_tool(
     # unknown hash resolves to a structured {"status": "missing"} tool result
     # (see CCRResponseHandler._execute_retrieval), not an exception or a 400.
     #
-    # Eager applies only when the client already sent a tools array. A request with no
-    # tools is not an agent harness: adding one would turn a no-tools request
-    # into a tools request, letting the model emit tool_use blocks the client
-    # never expected (#728), and such a client has no tool results to compress
-    # and so no warm tools segment to protect. The cache problem this fixes is
-    # a harness problem, and harnesses always send tools.
-    eager = bool(tools_out) and get_ccr_tool_injection_mode() == "eager"
+    # Eager injection needs three things to be true, because it is the one path
+    # that touches the tools array before anything has been compressed:
+    #
+    #   allow_eager -- the caller confirms it may rewrite this request's tools
+    #     at all. Under `--no-optimize` or a bypass header nothing will ever be
+    #     compressed, so the tool would be permanently unredeemable; the old
+    #     gate got this for free because no compression meant no injection.
+    #   a non-empty client tools array -- adding the first entry would turn a
+    #     no-tools request into a tools request and let the model emit tool_use
+    #     blocks the client never expected (#728). Such a client also has no
+    #     tool results to compress, so there is no warm tools segment to
+    #     protect. The cache problem is a harness problem, and harnesses always
+    #     send tools.
+    #   the eager mode -- operators can restore the historical gate.
+    eager = allow_eager and bool(tools_out) and get_ccr_tool_injection_mode() == "eager"
     if not (eager or has_compressed_content_this_turn):
         log_tool_injection_decision(
             provider=provider,
