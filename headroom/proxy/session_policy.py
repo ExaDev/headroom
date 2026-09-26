@@ -17,7 +17,9 @@ CLAUDE_CODE_SESSION_HEADER = "x-claude-code-session-id"
 #: Headroom-injected fallback for harnesses with no session header of their own.
 HEADROOM_SESSION_HEADER = "x-headroom-session-id"
 
-# : Internal ``tags`` key carrying the resolved id to the outcome funnel. : Listed in ``savings_attribution._INTERNAL_TAGS`` so it never reaches the : request log's string-label store.
+#: Internal ``tags`` key carrying the resolved id to the outcome funnel.
+#: Listed in ``savings_attribution._INTERNAL_TAGS`` so it never reaches the
+#: request log's string-label store.
 SESSION_TAG = "_headroom_session_id"
 
 
