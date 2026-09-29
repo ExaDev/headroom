@@ -6,6 +6,7 @@ Contains SSE parsing, streaming response generation, and related utilities.
 from __future__ import annotations
 
 import asyncio
+import collections.abc
 import contextlib
 import json
 import logging
@@ -1249,9 +1250,63 @@ class StreamingMixin:
             pending_messages: list[dict] = []
 
             try:
-                async with contextlib.aclosing(upstream_response) as response:
+                async with contextlib.aclosing(upstream_response):
                     sse_chunk_index = 0
-                    async for chunk in response.aiter_bytes():
+
+                    async def _resilient_chunks() -> collections.abc.AsyncIterator[bytes]:
+                        """Yield upstream body chunks, absorbing a connection retirement at stream start.
+
+                        Providers periodically retire the proxy's pooled upstream connections mid-response (an h2 stream reset or GOAWAY; routine load-balancer behaviour, not an error). While nothing has been released downstream the request can be replayed on a fresh connection invisibly, so the first chunk is held until a second chunk arrives or the stream ends. Real streams emit their opening events back-to-back, which bounds the hold to one upstream inter-event gap at stream start; anything after that gap is released immediately and a later death re-raises unchanged, because replaying would duplicate bytes the client already has. Replays share the configured retry budget and backoff of the pre-stream send loop. (ExaDev/headroom#4)
+                        """
+                        replays = 0
+                        attempt_response = upstream_response
+                        while True:
+                            held: bytes | None = None
+                            released = False
+                            try:
+                                async with contextlib.aclosing(attempt_response):
+                                    async for received in attempt_response.aiter_bytes():
+                                        if held is None and not released:
+                                            held = received
+                                            continue
+                                        if held is not None and not released:
+                                            released = True
+                                            yield held
+                                            held = None
+                                        yield received
+                                if held is not None:
+                                    released = True
+                                    yield held
+                                return
+                            except httpx.TransportError as death:
+                                if (
+                                    released
+                                    or not self.config.retry_enabled
+                                    or replays >= retry_attempts - 1
+                                ):
+                                    raise
+                                replays += 1
+                                await attempt_response.aclose()
+                                delay_with_jitter = jitter_delay_ms(
+                                    self.config.retry_base_delay_ms,
+                                    self.config.retry_max_delay_ms,
+                                    replays,
+                                )
+                                logger.warning(
+                                    f"[{request_id}] Upstream connection retired mid-response before "
+                                    f"any byte reached the client (replay {replays}/{retry_attempts - 1}): "
+                                    f"{death!r}; replaying on a fresh connection"
+                                )
+                                await asyncio.sleep(delay_with_jitter / 1000)
+                                replay_request = self.http_client.build_request(
+                                    "POST", url, content=outbound_bytes, headers=outbound_headers
+                                )
+                                attempt_response = await self.http_client.send(
+                                    replay_request, stream=True
+                                )
+                                # The replay's status and headers may differ from the response whose status line was already forwarded; its body streams under the original envelope, matching what the exhausted-retry path surfaces.
+
+                    async for chunk in _resilient_chunks():
                         sse_chunk_index += 1
                         # Record TTFB on first chunk
                         if stream_state["ttfb_ms"] is None:
