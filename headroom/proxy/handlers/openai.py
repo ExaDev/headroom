@@ -593,6 +593,14 @@ def _passthrough_usage_from_json(payload: Any) -> dict[str, int]:
     return {}
 
 
+def _accepts_event_stream(request: Request) -> bool:
+    """Whether the client asked for a Server-Sent Events response.
+
+    Such a response has no natural end, so the pass-through must relay it chunk by chunk: buffering it holds the client socket and an upstream pooled connection open until a timeout, and the client never sees an event.
+    """
+    return "text/event-stream" in request.headers.get("accept", "").lower()
+
+
 def _passthrough_model_from_path(path: str, endpoint_name: str) -> str:
     marker = "/models/"
     if marker in path:
@@ -11043,7 +11051,9 @@ class OpenAIHandlerMixin:
         """
         from fastapi.responses import Response
 
-        if endpoint_name in {"streamGenerateContent", "streamRawPredict"} and provider:
+        if (
+            endpoint_name in {"streamGenerateContent", "streamRawPredict"} and provider
+        ) or _accepts_event_stream(request):
             return await self._handle_streaming_passthrough(
                 request=request,
                 base_url=base_url,
@@ -11281,10 +11291,16 @@ class OpenAIHandlerMixin:
         self,
         request: Request,
         base_url: str,
-        endpoint_name: str,
-        provider: str,
+        endpoint_name: str | None,
+        provider: str | None,
     ) -> Response:
-        """Stream pass-through responses without buffering the upstream body."""
+        """Stream pass-through responses without buffering the upstream body.
+
+        Telemetry is recorded only for a classified endpoint (both ``endpoint_name`` and
+        ``provider`` set), matching the buffered path. The upstream connection is closed
+        when the body iterator ends or is cancelled, so a client that disconnects from a
+        long-lived event stream releases its pooled upstream connection at once.
+        """
         from fastapi.responses import Response, StreamingResponse
 
         from headroom.proxy.helpers import MAX_SSE_BUFFER_SIZE
@@ -11410,54 +11426,60 @@ class OpenAIHandlerMixin:
                         if stream_state["ttfb_ms"] is None:
                             stream_state["ttfb_ms"] = (time.time() - start_time) * 1000
                         stream_state["total_bytes"] += len(chunk)
-                        stream_state["sse_buffer"].extend(chunk)
-                        if len(stream_state["sse_buffer"]) > MAX_SSE_BUFFER_SIZE:
-                            tail = bytes(stream_state["sse_buffer"][-MAX_SSE_BUFFER_SIZE // 2 :])
-                            stream_state["sse_buffer"] = bytearray(tail)
+                        if endpoint_name and provider:
+                            stream_state["sse_buffer"].extend(chunk)
+                            if len(stream_state["sse_buffer"]) > MAX_SSE_BUFFER_SIZE:
+                                tail = bytes(
+                                    stream_state["sse_buffer"][-MAX_SSE_BUFFER_SIZE // 2 :]
+                                )
+                                stream_state["sse_buffer"] = bytearray(tail)
 
+                            _absorb_usage(
+                                self._parse_sse_usage_from_buffer(stream_state, stream_provider)
+                            )
+                        yield chunk
+            finally:
+                if endpoint_name and provider:
+                    buf = stream_state["sse_buffer"]
+                    if len(buf) > 0:
+                        buf.extend(b"\n\n")
                         _absorb_usage(
                             self._parse_sse_usage_from_buffer(stream_state, stream_provider)
                         )
-                        yield chunk
-            finally:
-                buf = stream_state["sse_buffer"]
-                if len(buf) > 0:
-                    buf.extend(b"\n\n")
-                    _absorb_usage(self._parse_sse_usage_from_buffer(stream_state, stream_provider))
 
-                input_tokens = stream_state["input_tokens"] or 0
-                output_tokens = stream_state["output_tokens"] or 0
-                cache_read_tokens = stream_state["cache_read_input_tokens"] or 0
-                cache_write_tokens = stream_state["cache_creation_input_tokens"] or 0
-                uncached_input_tokens = max(
-                    0,
-                    input_tokens - cache_read_tokens - cache_write_tokens,
-                )
-                await self._record_request_outcome(
-                    RequestOutcome(
-                        request_id=request_id,
-                        provider=provider,
-                        model=_passthrough_model_from_path(path, endpoint_name),
-                        original_tokens=input_tokens,
-                        optimized_tokens=input_tokens,
-                        output_tokens=output_tokens,
-                        tokens_saved=0,
-                        attempted_input_tokens=input_tokens,
-                        cache_read_tokens=cache_read_tokens,
-                        cache_write_tokens=cache_write_tokens,
-                        cache_write_5m_tokens=stream_state[
-                            "cache_creation_ephemeral_5m_input_tokens"
-                        ],
-                        cache_write_1h_tokens=stream_state[
-                            "cache_creation_ephemeral_1h_input_tokens"
-                        ],
-                        uncached_input_tokens=uncached_input_tokens,
-                        total_latency_ms=(time.time() - start_time) * 1000,
-                        ttfb_ms=stream_state["ttfb_ms"] or 0,
-                        tags=tags,
-                        client=client,
+                    input_tokens = stream_state["input_tokens"] or 0
+                    output_tokens = stream_state["output_tokens"] or 0
+                    cache_read_tokens = stream_state["cache_read_input_tokens"] or 0
+                    cache_write_tokens = stream_state["cache_creation_input_tokens"] or 0
+                    uncached_input_tokens = max(
+                        0,
+                        input_tokens - cache_read_tokens - cache_write_tokens,
                     )
-                )
+                    await self._record_request_outcome(
+                        RequestOutcome(
+                            request_id=request_id,
+                            provider=provider,
+                            model=_passthrough_model_from_path(path, endpoint_name),
+                            original_tokens=input_tokens,
+                            optimized_tokens=input_tokens,
+                            output_tokens=output_tokens,
+                            tokens_saved=0,
+                            attempted_input_tokens=input_tokens,
+                            cache_read_tokens=cache_read_tokens,
+                            cache_write_tokens=cache_write_tokens,
+                            cache_write_5m_tokens=stream_state[
+                                "cache_creation_ephemeral_5m_input_tokens"
+                            ],
+                            cache_write_1h_tokens=stream_state[
+                                "cache_creation_ephemeral_1h_input_tokens"
+                            ],
+                            uncached_input_tokens=uncached_input_tokens,
+                            total_latency_ms=(time.time() - start_time) * 1000,
+                            ttfb_ms=stream_state["ttfb_ms"] or 0,
+                            tags=tags,
+                            client=client,
+                        )
+                    )
 
         media_type = upstream_response.headers.get("content-type") or "text/event-stream"
         return StreamingResponse(
