@@ -29,7 +29,9 @@ from headroom.proxy.unix_socket import (  # noqa: E402
     UnixSocketInUseError,
     UnixSocketUnusableError,
     bind_unix_listener,
+    max_socket_path_bytes,
     require_unix_sockets,
+    resolve_unix_socket_path,
 )
 
 pytestmark = pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="needs AF_UNIX")
@@ -211,6 +213,47 @@ class TestBindUnixListener:
             successor.close()
 
 
+class TestSocketPathResolution:
+    def test_limit_is_the_longest_path_a_bind_accepts(self, socket_dir: Path):
+        limit = max_socket_path_bytes()
+        fitting = socket_dir / ("a" * (limit - len(str(socket_dir)) - 1))
+        assert len(os.fsencode(fitting)) == limit
+        listener = bind_unix_listener(str(fitting))
+        listener.close()
+        with pytest.raises(UnixSocketUnusableError, match=rf"is {limit + 1} bytes, longer than"):
+            bind_unix_listener(f"{fitting}b")
+
+    def test_error_names_resolved_length_and_limit(self, socket_dir: Path):
+        path = str(socket_dir / ("a" * 300))
+        length = len(path)
+        with pytest.raises(UnixSocketUnusableError) as caught:
+            resolve_unix_socket_path(path)
+        message = str(caught.value)
+        assert path in message
+        assert f"{length} bytes" in message
+        assert f"the {max_socket_path_bytes()} bytes" in message
+
+    def test_relative_path_is_resolved_against_the_current_directory(
+        self, socket_dir: Path, monkeypatch
+    ):
+        monkeypatch.chdir(socket_dir)
+        assert resolve_unix_socket_path("proxy.sock") == os.path.join(os.getcwd(), "proxy.sock")
+
+    def test_tilde_is_expanded_before_measuring(self, socket_dir: Path, monkeypatch):
+        monkeypatch.setenv("HOME", str(socket_dir))
+        assert resolve_unix_socket_path("~/proxy.sock") == os.path.join(
+            os.path.abspath(socket_dir), "proxy.sock"
+        )
+        # Short as typed, too long once the home directory is substituted.
+        monkeypatch.setenv("HOME", str(socket_dir / ("h" * max_socket_path_bytes())))
+        with pytest.raises(UnixSocketUnusableError, match="bytes, longer than"):
+            resolve_unix_socket_path("~/p.sock")
+
+    def test_empty_path_rejected(self):
+        with pytest.raises(UnixSocketUnusableError, match="not an empty string"):
+            resolve_unix_socket_path("")
+
+
 class TestProxyConfigUds:
     def test_instance_key_is_port_for_tcp(self):
         assert ProxyConfig(port=9123).instance_key == 9123
@@ -228,6 +271,29 @@ class TestProxyConfigUds:
 
 
 class TestCliUdsFlag:
+    def test_banner_and_config_use_the_resolved_path(self, socket_dir: Path, monkeypatch):
+        monkeypatch.chdir(socket_dir)
+        result, config = self._invoke(
+            ["--uds", "proxy.sock"], env={"HEADROOM_HOST": None, "HEADROOM_PORT": None}
+        )
+        resolved = os.path.join(os.getcwd(), "proxy.sock")
+        assert result.exit_code == 0, result.output
+        assert config is not None
+        assert config.uds == resolved
+        assert f"unix:{resolved}" in result.output
+        assert f"curl --unix-socket {resolved} http://localhost/health" in result.output
+
+    def test_too_long_path_is_a_one_line_error_before_the_banner(self, socket_dir: Path):
+        path = str(socket_dir / ("a" * 300))
+        result, config = self._invoke(
+            ["--uds", path], env={"HEADROOM_HOST": None, "HEADROOM_PORT": None}
+        )
+        assert result.exit_code == 1
+        assert config is None
+        assert result.output.count("\n") == 1
+        assert result.output.startswith(f"Error: socket path {path} is {len(path)} bytes")
+        assert "unix:" not in result.output
+
     def _invoke(self, args: list[str], env: dict[str, str | None] | None = None):
         captured: dict[str, ProxyConfig] = {}
 
@@ -290,6 +356,18 @@ class TestCliSocketInUse:
 
 
 class TestModuleEntrypointUdsFlag:
+    def test_too_long_path_refused(self, socket_dir: Path):
+        path = str(socket_dir / ("a" * 300))
+        proc = subprocess.run(
+            [sys.executable, "-m", "headroom.proxy.server", "--uds", path],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            env=_env_without_tcp_listen_vars(),
+        )
+        assert proc.returncode == 1
+        assert proc.stderr.strip().startswith(f"error: socket path {path} is {len(path)} bytes")
+
     def test_uds_with_port_refused(self):
         proc = subprocess.run(
             [sys.executable, "-m", "headroom.proxy.server", "--uds", "/run/x.sock", "--port", "9"],
