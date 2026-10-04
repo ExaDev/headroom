@@ -7,6 +7,7 @@ Claude Code's Remote Control (GH #1779).
 
 from __future__ import annotations
 
+import os
 import shutil
 import socket
 import stat
@@ -24,6 +25,7 @@ from headroom.proxy.uds import (
     UdsError,
     _missing_ancestors,
     _require_safe_existing_parent,
+    bind_uds_listener,
     max_uds_path_length,
     prepare_uds_path,
     remove_uds_path,
@@ -327,6 +329,23 @@ def test_oversized_path_advice_does_not_point_at_tmpdir(sock_dir: Path) -> None:
 
 
 @requires_uds
+@pytest.mark.parametrize("parent_mode", [0o755, 0o1777])
+def test_bound_socket_is_owner_only_in_a_shared_parent(sock_dir: Path, parent_mode: int) -> None:
+    """An existing 0755 or sticky parent is accepted, so the socket's own mode must keep other users out."""
+    parent = sock_dir / "shared"
+    parent.mkdir()
+    parent.chmod(parent_mode)
+
+    listener = bind_uds_listener(prepare_uds_path(parent / "headroom.sock"))
+    try:
+        assert stat.S_IMODE((parent / "headroom.sock").stat().st_mode) == 0o600
+    finally:
+        listener.close()
+
+    assert not (parent / "headroom.sock").exists()
+
+
+@requires_uds
 def test_remove_uds_path_is_socket_only(sock_dir: Path) -> None:
     """Cleanup runs in a finally block, so it must be narrow and never raise."""
     sock_path = sock_dir / "gone.sock"
@@ -364,6 +383,12 @@ def _bind_kwargs_for(**config_kwargs: object) -> dict[str, object]:
         uvicorn_kwargs,  # noqa: ANN001
     ):
         captured.update(bind_kwargs)
+        if "fd" in bind_kwargs:
+            bound = socket.socket(fileno=os.dup(bind_kwargs["fd"]))
+            try:
+                captured["socket_mode"] = stat.S_IMODE(os.stat(bound.getsockname()).st_mode)
+            finally:
+                bound.close()
 
     with (
         patch("headroom.proxy.server._run_uvicorn", side_effect=fake_run_uvicorn),
@@ -389,8 +414,8 @@ def test_run_server_binds_the_socket_instead_of_a_port(sock_dir: Path) -> None:
 
     bind = _bind_kwargs_for(host="127.0.0.1", port=9123, uds=str(target))
 
-    assert bind == {"uds": str(target)}
-    assert "host" not in bind and "port" not in bind
+    assert set(bind) == {"fd", "socket_mode"}
+    assert bind["socket_mode"] == 0o600, "uvicorn must receive a socket already narrowed to 0600"
 
 
 @requires_uds
@@ -409,9 +434,6 @@ def test_run_server_removes_the_socket_on_exit(sock_dir: Path) -> None:
         log_level,  # noqa: ANN001
         uvicorn_kwargs,  # noqa: ANN001
     ):
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.bind(bind_kwargs["uds"])
-        sock.close()
         raise KeyboardInterrupt
 
     with (

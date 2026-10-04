@@ -5502,33 +5502,32 @@ def run_server(
     # and no CLI flag to change it. Overridable now; the default is unchanged.
     uvicorn_log_level = _resolve_uvicorn_log_level()
 
-    # Bind target: a Unix socket when one is configured, otherwise host:port.
-    # uvicorn treats `uds` and `host`/`port` as alternatives, so they are built
-    # here rather than passed together.
-    bind_kwargs: dict[str, Any]
-    uds_path: Path | None = None
     if config.uds:
-        from headroom.proxy.uds import prepare_uds_path
+        from headroom.proxy.uds import bind_uds_listener, prepare_uds_path
 
-        uds_path = prepare_uds_path(config.uds)
-        bind_kwargs = {"uds": str(uds_path)}
+        # Headroom binds the socket and hands uvicorn the descriptor, so the
+        # socket is 0600 before uvicorn listens; see bind_uds_listener().
+        listener = bind_uds_listener(prepare_uds_path(config.uds))
+        try:
+            _run_uvicorn(
+                app_target,
+                {"fd": listener.sock.fileno()},
+                workers,
+                limit_concurrency,
+                uvicorn_log_level,
+                uvicorn_kwargs,
+            )
+        finally:
+            listener.close()
     else:
-        bind_kwargs = {"host": config.host, "port": config.port}
-
-    try:
         _run_uvicorn(
             app_target,
-            bind_kwargs,
+            {"host": config.host, "port": config.port},
             workers,
             limit_concurrency,
             uvicorn_log_level,
             uvicorn_kwargs,
         )
-    finally:
-        if uds_path is not None:
-            from headroom.proxy.uds import remove_uds_path
-
-            remove_uds_path(uds_path)
 
 
 def _run_uvicorn(
@@ -5550,7 +5549,9 @@ def _run_uvicorn(
         # request.client.host. uvicorn's ProxyHeadersMiddleware rewrites that
         # from X-Forwarded-For when FORWARDED_ALLOW_IPS is broader than the
         # default. Disabling proxy_headers here guarantees the guard sees the
-        # real peer address regardless of env.
+        # real peer address regardless of env. Over a Unix socket uvicorn reports
+        # no peer address, so request.client is None, which the guard treats as
+        # local: the socket's 0600 mode limits peers to the proxy's own user.
         proxy_headers=False,
         timeout_graceful_shutdown=10,
         **uvicorn_kwargs,

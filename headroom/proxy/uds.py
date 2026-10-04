@@ -18,10 +18,12 @@ separately requires claude.ai subscription auth — so the same variable opens o
 gate and closes the other. Verified on Claude Code 2.1.198; see
 ``docs/content/docs/troubleshooting.mdx``.
 
-Access control is filesystem permissions. A socket inherits no credentials of
-its own, so the mode of the directory holding it *is* the security boundary.
-A parent this module creates is made ``0700``; a parent that already exists is
-never modified, only checked, since something else owns its policy.
+Access control is filesystem permissions, in two layers. The socket itself is
+created ``0600`` (connecting needs write permission on it), so only the proxy's
+own user can connect even when the parent directory is ``0755`` or a sticky
+``/tmp``-style directory. The parent directory guards the socket against being
+replaced: a parent this module creates is made ``0700``; a parent that already
+exists is never modified, only checked, since something else owns its policy.
 """
 
 from __future__ import annotations
@@ -31,10 +33,14 @@ import os
 import socket
 import stat
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 __all__ = [
+    "SOCKET_MODE",
     "UDS_SUPPORTED",
+    "UdsListener",
+    "bind_uds_listener",
     "UdsError",
     "socket_usage_lines",
     "max_uds_path_length",
@@ -57,6 +63,11 @@ UDS_SUPPORTED = _AF_UNIX != -1
 # that says nothing about which path was too long, so check it up front.
 _SUN_PATH_MAX_LINUX = 108
 _SUN_PATH_MAX_BSD = 104
+
+
+#: Owner read and write. Connecting to a Unix socket needs write permission on it,
+#: so this mode admits only the proxy's own user, whatever the parent's mode.
+SOCKET_MODE = stat.S_IRUSR | stat.S_IWUSR
 
 
 class UdsError(RuntimeError):
@@ -191,7 +202,7 @@ def _prepare_parent_dir(parent: Path) -> None:
 def prepare_uds_path(path: str | os.PathLike[str], *, platform: str | None = None) -> Path:
     """Validate *path*, create its parent ``0700``, and clear a stale socket.
 
-    Returns the resolved path, ready to hand to uvicorn's ``uds=``.
+    Returns the resolved path, ready for :func:`bind_uds_listener`.
 
     The parent is created ``0700`` when it does not exist. An existing parent is
     left exactly as it is -- see :func:`_require_safe_existing_parent`.
@@ -235,6 +246,39 @@ def prepare_uds_path(path: str | os.PathLike[str], *, platform: str | None = Non
         resolved.unlink()
 
     return resolved
+
+
+@dataclass
+class UdsListener:
+    """A bound, not yet listening, stream socket at *path* with mode :data:`SOCKET_MODE`."""
+
+    path: Path
+    sock: socket.socket
+
+    def close(self) -> None:
+        """Close the socket and remove its file."""
+        self.sock.close()
+        remove_uds_path(self.path)
+
+
+def bind_uds_listener(path: Path) -> UdsListener:
+    """Bind a stream socket at *path*, as returned by :func:`prepare_uds_path`.
+
+    The socket's mode is set to :data:`SOCKET_MODE` before it is returned, and it
+    is returned without ``listen()`` having been called: uvicorn receives its
+    descriptor (``fd=``) and starts listening, so no peer can connect while the
+    file still carries the umask-derived mode. Passing the path to uvicorn as
+    ``uds=`` instead would leave the socket ``0666``, which in an existing
+    ``0755`` or sticky parent lets every local user connect.
+    """
+    sock = socket.socket(_AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.bind(str(path))
+        os.chmod(path, SOCKET_MODE)
+    except BaseException:
+        sock.close()
+        raise
+    return UdsListener(path=path, sock=sock)
 
 
 def remove_uds_path(path: str | os.PathLike[str]) -> None:
