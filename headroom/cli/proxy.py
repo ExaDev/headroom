@@ -1821,6 +1821,8 @@ Press Ctrl+C to stop.
             )
             os.environ.pop("HEADROOM_EMBEDDING_SERVER_SOCKET", None)
 
+    from headroom.proxy.unix_socket import UnixSocketInUseError
+
     try:
         run_kwargs: dict[str, Any] = {}
         if workers != 1:
@@ -1832,6 +1834,8 @@ Press Ctrl+C to stop.
         # the legacy banner via run_server's default.
         run_kwargs["print_banner"] = False
         run_server(config, **run_kwargs)
+    except UnixSocketInUseError as exc:
+        raise click.ClickException(str(exc)) from None
     except KeyboardInterrupt:
         click.echo("\nShutting down...")
         raise SystemExit(130) from None
