@@ -267,11 +267,10 @@ SETTINGS: tuple[SettingField, ...] = (
         "Networking",
         "str",
         default=None,
-        manifest_managed=True,
         help=(
             "Serve on a Unix domain socket at this path instead of host/port. "
-            "POSIX only; leave empty to bind host/port. Managed by the install "
-            "manifest on docker/service installs."
+            "POSIX only; leave empty to bind host/port. Cannot be combined with "
+            "HEADROOM_HOST or HEADROOM_PORT."
         ),
         tier="advanced",
     ),

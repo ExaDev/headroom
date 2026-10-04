@@ -582,3 +582,37 @@ def test_relative_and_absolute_spellings_share_one_instance_key(
     absolute = ProxyConfig(uds=str(Path.cwd() / "proxy.sock")).instance_key
 
     assert relative == absolute
+
+
+# --------------------------------------------------------------------------
+# Listen-address conflicts: a socket path never silently overrides a port.
+# --------------------------------------------------------------------------
+
+
+@requires_uds
+@pytest.mark.parametrize(
+    ("args", "env", "named"),
+    [
+        (["--uds", "/tmp/hr.sock", "--port", "8798"], {}, "--port"),
+        (["--uds", "/tmp/hr.sock", "--host", "127.0.0.1"], {}, "--host"),
+        (["--uds", "/tmp/hr.sock"], {"HEADROOM_PORT": "8798"}, "--port"),
+        (["--port", "8798"], {"HEADROOM_UDS": "/tmp/hr.sock"}, "--port"),
+    ],
+)
+def test_uds_with_an_explicit_tcp_address_is_a_usage_error(
+    args: list[str], env: dict[str, str], named: str
+) -> None:
+    result = CliRunner().invoke(proxy_cmd, args, env=env)
+
+    assert result.exit_code == 2, result.output
+    assert "cannot be combined with" in result.output
+    assert named in result.output
+
+
+def test_headroom_uds_is_not_claimed_by_the_install_manifest() -> None:
+    """No install manifest sets HEADROOM_UDS, so marking it manifest-managed misdescribed it."""
+    from headroom.settings_store import SETTINGS
+
+    (field,) = [f for f in SETTINGS if f.env == "HEADROOM_UDS"]
+    assert not field.manifest_managed
+    assert "manifest" not in field.help

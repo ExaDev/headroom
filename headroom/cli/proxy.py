@@ -198,6 +198,25 @@ def _get_env_float_optional(name: str) -> float | None:
         raise click.ClickException(f"{name} must be a number, got {val!r}") from None
 
 
+def _refuse_tcp_listen_options_with_uds(ctx: click.Context) -> None:
+    """Raise :class:`click.UsageError` when ``--host`` or ``--port`` was set alongside ``--uds``.
+
+    Both count as set when given on the command line or through
+    ``HEADROOM_HOST``/``HEADROOM_PORT``. A socket listener binds no TCP address,
+    so honouring either silently would hide a configuration that expects the
+    proxy on a port, such as a stored ``HEADROOM_UDS`` overriding ``--port``.
+    """
+    explicit = (click.core.ParameterSource.COMMANDLINE, click.core.ParameterSource.ENVIRONMENT)
+    conflicting = [
+        f"--{name}" for name in ("host", "port") if ctx.get_parameter_source(name) in explicit
+    ]
+    if conflicting:
+        raise click.UsageError(
+            f"--uds (or HEADROOM_UDS) cannot be combined with {' or '.join(conflicting)} "
+            "(set on the command line or through HEADROOM_HOST/HEADROOM_PORT)"
+        )
+
+
 def default_embedding_socket(config: "ProxyConfig") -> str:
     """Default embedding sidecar socket path, keyed by ``config.instance_key`` so concurrent proxies never share a sidecar."""
     return f"/tmp/headroom-embed-{config.instance_key}.sock"
@@ -1147,6 +1166,7 @@ def proxy(
             require_uds_support()
         except UdsError as exc:
             raise click.ClickException(str(exc)) from exc
+        _refuse_tcp_listen_options_with_uds(ctx)
 
     ensure_proxy_dependencies()
 
