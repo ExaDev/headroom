@@ -29,9 +29,9 @@ from headroom.proxy.unix_socket import (  # noqa: E402
     UnixSocketInUseError,
     UnixSocketUnusableError,
     bind_unix_listener,
+    checked_unix_socket_path,
     max_socket_path_bytes,
     require_unix_sockets,
-    resolve_unix_socket_path,
 )
 
 pytestmark = pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="needs AF_UNIX")
@@ -227,7 +227,7 @@ class TestSocketPathResolution:
         path = str(socket_dir / ("a" * 300))
         length = len(path)
         with pytest.raises(UnixSocketUnusableError) as caught:
-            resolve_unix_socket_path(path)
+            checked_unix_socket_path(path)
         message = str(caught.value)
         assert path in message
         assert f"{length} bytes" in message
@@ -237,21 +237,59 @@ class TestSocketPathResolution:
         self, socket_dir: Path, monkeypatch
     ):
         monkeypatch.chdir(socket_dir)
-        assert resolve_unix_socket_path("proxy.sock") == os.path.join(os.getcwd(), "proxy.sock")
+        assert checked_unix_socket_path("proxy.sock") == os.path.join(os.getcwd(), "proxy.sock")
 
     def test_tilde_is_expanded_before_measuring(self, socket_dir: Path, monkeypatch):
         monkeypatch.setenv("HOME", str(socket_dir))
-        assert resolve_unix_socket_path("~/proxy.sock") == os.path.join(
+        assert checked_unix_socket_path("~/proxy.sock") == os.path.join(
             os.path.abspath(socket_dir), "proxy.sock"
         )
         # Short as typed, too long once the home directory is substituted.
         monkeypatch.setenv("HOME", str(socket_dir / ("h" * max_socket_path_bytes())))
         with pytest.raises(UnixSocketUnusableError, match="bytes, longer than"):
-            resolve_unix_socket_path("~/p.sock")
+            checked_unix_socket_path("~/p.sock")
 
     def test_empty_path_rejected(self):
         with pytest.raises(UnixSocketUnusableError, match="not an empty string"):
-            resolve_unix_socket_path("")
+            checked_unix_socket_path("")
+
+
+class TestSocketParentDirectory:
+    def _refused(self, path: Path, match: str) -> None:
+        with pytest.raises(UnixSocketUnusableError, match=match):
+            checked_unix_socket_path(str(path))
+
+    @pytest.mark.parametrize("mode", [0o700, 0o750, 0o755])
+    def test_directory_only_the_owner_can_write_is_accepted(self, socket_dir: Path, mode: int):
+        socket_dir.chmod(mode)
+        path = str(socket_dir / "proxy.sock")
+        assert checked_unix_socket_path(path) == os.path.abspath(path)
+
+    @pytest.mark.parametrize("mode", [0o770, 0o707, 0o777, 0o1777, 0o1770])
+    def test_directory_writable_by_group_or_others_is_refused(self, socket_dir: Path, mode: int):
+        socket_dir.chmod(mode)
+        self._refused(socket_dir / "proxy.sock", "writable by group or others")
+
+    def test_directory_owned_by_someone_else_is_refused(self, socket_dir: Path, monkeypatch):
+        owner = os.stat(socket_dir).st_uid
+        monkeypatch.setattr(os, "geteuid", lambda: owner + 1)
+        self._refused(socket_dir / "proxy.sock", rf"owned by uid {owner}, not by the user")
+
+    def test_missing_directory_is_refused_and_not_created(self, socket_dir: Path):
+        missing = socket_dir / "absent"
+        self._refused(missing / "proxy.sock", "does not exist")
+        assert not missing.exists()
+
+    def test_parent_that_is_a_file_is_refused(self, socket_dir: Path):
+        (socket_dir / "file").touch()
+        self._refused(socket_dir / "file" / "proxy.sock", "is not a directory")
+
+    def test_bind_applies_the_check_and_leaves_the_directory_mode_alone(self, socket_dir: Path):
+        socket_dir.chmod(0o770)
+        with pytest.raises(UnixSocketUnusableError, match="writable by group or others"):
+            bind_unix_listener(str(socket_dir / "proxy.sock"))
+        assert stat.S_IMODE(os.stat(socket_dir).st_mode) == 0o770
+        assert list(socket_dir.iterdir()) == []
 
 
 class TestProxyConfigUds:
@@ -304,14 +342,15 @@ class TestCliUdsFlag:
             result = CliRunner().invoke(main, ["proxy", *args], env=env or {})
         return result, captured.get("config")
 
-    def test_uds_reaches_proxy_config(self):
+    def test_uds_reaches_proxy_config(self, socket_dir: Path):
+        path = os.path.join(os.path.abspath(socket_dir), "proxy.sock")
         result, config = self._invoke(
-            ["--uds", "/run/x/proxy.sock"], env={"HEADROOM_HOST": None, "HEADROOM_PORT": None}
+            ["--uds", path], env={"HEADROOM_HOST": None, "HEADROOM_PORT": None}
         )
         assert result.exit_code == 0, result.output
         assert config is not None
-        assert config.uds == "/run/x/proxy.sock"
-        assert "unix:/run/x/proxy.sock" in result.output
+        assert config.uds == path
+        assert f"unix:{path}" in result.output
 
     @pytest.mark.parametrize(
         ("args", "env"),
@@ -330,6 +369,22 @@ class TestCliUdsFlag:
 
 def _env_without_tcp_listen_vars() -> dict[str, str]:
     return {k: v for k, v in os.environ.items() if k not in ("HEADROOM_HOST", "HEADROOM_PORT")}
+
+
+class TestCliSocketParent:
+    def test_group_writable_parent_is_a_one_line_error_before_the_banner(self, socket_dir: Path):
+        socket_dir.chmod(0o770)
+        with patch("headroom.proxy.server.run_server") as run_server:
+            result = CliRunner().invoke(
+                main,
+                ["proxy", "--uds", str(socket_dir / "proxy.sock")],
+                env={"HEADROOM_HOST": None, "HEADROOM_PORT": None},
+            )
+        assert result.exit_code == 1
+        run_server.assert_not_called()
+        assert result.output.count("\n") == 1
+        assert result.output.startswith(f"Error: directory {socket_dir} is writable by group")
+        assert "unix:" not in result.output
 
 
 class TestCliSocketInUse:
@@ -356,6 +411,18 @@ class TestCliSocketInUse:
 
 
 class TestModuleEntrypointUdsFlag:
+    def test_group_writable_parent_refused(self, socket_dir: Path):
+        socket_dir.chmod(0o770)
+        proc = subprocess.run(
+            [sys.executable, "-m", "headroom.proxy.server", "--uds", str(socket_dir / "p.sock")],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            env=_env_without_tcp_listen_vars(),
+        )
+        assert proc.returncode == 1
+        assert proc.stderr.strip().startswith(f"error: directory {socket_dir} is writable by group")
+
     def test_too_long_path_refused(self, socket_dir: Path):
         path = str(socket_dir / ("a" * 300))
         proc = subprocess.run(
