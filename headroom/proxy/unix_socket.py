@@ -19,6 +19,7 @@ Contract with the caller:
 from __future__ import annotations
 
 import errno
+import functools
 import os
 import signal
 import socket
@@ -76,6 +77,58 @@ class UnixSocketListener:
             os.unlink(self.path)
 
 
+def _path_fits_sockaddr(length: int) -> bool:
+    """Whether the socket module accepts an absolute path of *length* bytes as an AF_UNIX address.
+
+    Connects to a name that does not exist, so a path that fits fails with the OS's own ``ENOENT`` and one that does not is rejected by the socket module before any syscall, with an ``OSError`` that carries no errno.
+    """
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.connect("/" + "a" * (length - 1))
+    except OSError as exc:
+        return exc.errno is not None
+    finally:
+        probe.close()
+    return True
+
+
+@functools.cache
+def max_socket_path_bytes() -> int:
+    """The longest path, in bytes, that this platform's ``sockaddr_un`` accepts.
+
+    ``sun_path`` is 104 bytes on macOS and the BSDs and 108 on Linux, and the socket module reserves room for a terminating NUL on some of them. Rather than hard-code that per platform, the limit is measured on the running interpreter, because the socket module's own check is the one a failed bind would hit. Found by doubling to a length that does not fit and bisecting below it.
+    """
+    fits = 1
+    too_long = 2
+    while _path_fits_sockaddr(too_long):
+        fits, too_long = too_long, too_long * 2
+    while too_long - fits > 1:
+        middle = (fits + too_long) // 2
+        if _path_fits_sockaddr(middle):
+            fits = middle
+        else:
+            too_long = middle
+    return fits
+
+
+def resolve_unix_socket_path(path: str) -> str:
+    """Return the absolute form of *path*, after checking that a socket can be bound there.
+
+    ``~`` is expanded and a relative path is resolved against the current directory first, because the limit applies to the path the kernel is handed, not the one the user typed. Raises :class:`UnixSocketUnusableError` when the resolved path is longer than :func:`max_socket_path_bytes`.
+    """
+    if path == "":
+        raise UnixSocketUnusableError("--uds must be a socket path, not an empty string")
+    resolved = os.path.abspath(os.path.expanduser(path))
+    length = len(os.fsencode(resolved))
+    limit = max_socket_path_bytes()
+    if length > limit:
+        raise UnixSocketUnusableError(
+            f"socket path {resolved} is {length} bytes, longer than the {limit} bytes "
+            f"{sys.platform} allows for a unix socket; use a shorter path"
+        )
+    return resolved
+
+
 def _remove_stale_socket(path: str) -> None:
     """Remove a socket file at *path* that nothing is listening on.
 
@@ -105,8 +158,9 @@ def _remove_stale_socket(path: str) -> None:
 def bind_unix_listener(path: str) -> UnixSocketListener:
     """Bind a stream socket at *path* with mode :data:`SOCKET_MODE`.
 
-    The socket is chmodded before uvicorn calls ``listen()`` on it, so no peer can connect while the file still carries the umask-derived mode.
+    The socket is chmodded before uvicorn calls ``listen()`` on it, so no peer can connect while the file still carries the umask-derived mode. The returned listener's ``path`` is the one resolved by :func:`resolve_unix_socket_path`.
     """
+    path = resolve_unix_socket_path(path)
     _remove_stale_socket(path)
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
