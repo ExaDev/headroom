@@ -616,3 +616,34 @@ def test_headroom_uds_is_not_claimed_by_the_install_manifest() -> None:
     (field,) = [f for f in SETTINGS if f.env == "HEADROOM_UDS"]
     assert not field.manifest_managed
     assert "manifest" not in field.help
+
+
+# --------------------------------------------------------------------------
+# cc-switch reconciler: it writes a TCP URL, so it cannot serve a socket proxy.
+# --------------------------------------------------------------------------
+
+
+@requires_uds
+def test_cli_refuses_the_cc_switch_reconciler_with_uds() -> None:
+    result = CliRunner().invoke(
+        proxy_cmd, ["--uds", "/tmp/hr.sock"], env={"HEADROOM_CC_SWITCH_RECONCILE": "1"}
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "HEADROOM_CC_SWITCH_RECONCILE" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_reconciler_refusal_applies_only_to_socket_listeners(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """create_app calls this too, so `python -m headroom.proxy.server` is covered."""
+    from headroom.proxy.cc_switch_reconciler import refuse_unix_socket_listener
+
+    monkeypatch.setenv("HEADROOM_CC_SWITCH_RECONCILE", "1")
+    refuse_unix_socket_listener(None)
+    with pytest.raises(ValueError, match="does not listen on"):
+        refuse_unix_socket_listener("/tmp/hr.sock")
+
+    monkeypatch.delenv("HEADROOM_CC_SWITCH_RECONCILE")
+    refuse_unix_socket_listener("/tmp/hr.sock")

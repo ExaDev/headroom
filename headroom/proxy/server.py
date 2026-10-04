@@ -2575,8 +2575,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     from headroom.proxy.cc_switch_reconciler import (
         CCSwitchReconciler,
         reconciler_enabled,
+        refuse_unix_socket_listener,
     )
 
+    refuse_unix_socket_listener(config.uds)
     _cc_reconciler: CCSwitchReconciler | None = None
     if reconciler_enabled():
         _cc_proxy_port = config.port if hasattr(config, "port") else 8787

@@ -1168,6 +1168,13 @@ def proxy(
             raise click.ClickException(str(exc)) from exc
         _refuse_tcp_listen_options_with_uds(ctx)
 
+        from headroom.proxy.cc_switch_reconciler import refuse_unix_socket_listener
+
+        try:
+            refuse_unix_socket_listener(uds)
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
+
     ensure_proxy_dependencies()
 
     # Import here to avoid slow startup
