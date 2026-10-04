@@ -13,7 +13,7 @@ Contract with the caller:
 * The parent directory must already exist and must be private to the user running the proxy: owned by the current effective uid and not writable by group or others (``0o700`` is the recommended mode). Whoever can write the directory can unlink the socket and bind their own at the same path, so this is checked, with a one-line error, before anything is bound; a sticky bit does not substitute for it (see :func:`_require_safe_parent`). This module never creates or chmods the directory; the socket's own ``0o600`` mode is the second layer, not the only one. Directories above the parent are not inspected.
 * A socket file left at the path by a process that has exited (nothing accepts connections on it) is removed and replaced. A socket that still accepts connections, or any path that is not a socket, is refused with :class:`UnixSocketInUseError`.
 * Checking for a stale socket and binding are two steps, so two proxies started on the same path at the same instant can race. Supervising a single proxy per path is the caller's job.
-* On clean shutdown the socket file is removed, but only if the path still names the socket this process bound. That includes SIGTERM: uvicorn finishes its graceful shutdown and then re-raises the signal with the previous handler restored, which under the default handler would kill the process before any cleanup ran, so :func:`serving_unix_socket` installs a handler that unwinds the stack instead and re-raises SIGTERM itself once the file is gone.
+* On clean shutdown the socket file is removed, but only if the path still names the socket this process bound. That includes SIGTERM: uvicorn finishes its graceful shutdown and then re-raises the signal with the previous handler restored, which under the default handler would kill the process before any cleanup ran, so :func:`serving_unix_socket` installs a handler that unwinds the stack instead and re-raises SIGTERM itself once the file is gone. With several workers uvicorn's supervisor handles SIGTERM itself and returns normally, and the file is removed on that path too.
 """
 
 from __future__ import annotations
@@ -214,6 +214,8 @@ def serving_unix_socket(path: str) -> Iterator[UnixSocketListener]:
     """Bind *path* for the duration of the block, removing the socket file when it exits.
 
     On the main thread SIGTERM unwinds the block, the file is removed, and SIGTERM is then re-raised under the handler that was in place before, so the process still ends the way it would have without this listener. ``signal.signal`` only works on the main thread, and off it uvicorn neither captures nor re-raises signals, so no handler is installed there.
+
+    With more than one worker, uvicorn's supervisor replaces this handler with its own when it starts. On SIGTERM or SIGINT it stops every worker and returns without re-raising, so the block exits normally, the file is still removed, and the process exits 0, as a multi-worker proxy on a TCP port does. This process keeps the listening socket open for the whole block, so a worker the supervisor restarts inherits the same socket.
     """
     listener = bind_unix_listener(path)
     on_main_thread = threading.current_thread() is threading.main_thread()

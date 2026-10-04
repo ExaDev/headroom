@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import socket
 import stat
@@ -568,3 +569,174 @@ class TestPlatformWithoutUnixSockets:
         )
         assert proc.returncode == 1
         assert proc.stderr.strip().startswith("error: --uds needs unix domain sockets")
+
+
+# Runs the real proxy with two uvicorn workers. Each worker is a fresh interpreter that builds the full app from the payload run_server exports, so nothing can be patched in; disabling Kompress and subscription tracking keeps startup short and offline.
+_MULTI_WORKER_SCRIPT = textwrap.dedent(
+    """
+    import sys
+    from headroom.proxy.models import ProxyConfig
+    from headroom.proxy.server import run_server
+
+    config = ProxyConfig(uds=sys.argv[1], disable_kompress=True, subscription_tracking_enabled=False)
+    run_server(config, workers=int(sys.argv[2]), print_banner=False)
+    """
+)
+
+_WORKERS = 2
+
+# Each real worker builds the whole app, which takes several seconds.
+_WORKER_DEADLINE_SECONDS = 90
+
+
+def _descendants(root: int) -> set[int]:
+    """Every live process below *root*, read from ``ps``, which reports parents the same way on Linux and macOS."""
+    listing = subprocess.run(
+        ["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True, check=True
+    ).stdout
+    children: dict[int, list[int]] = {}
+    for line in listing.splitlines():
+        pid, ppid = (int(field) for field in line.split())
+        children.setdefault(ppid, []).append(pid)
+    found: set[int] = set()
+    pending = [root]
+    while pending:
+        for child in children.get(pending.pop(), []):
+            found.add(child)
+            pending.append(child)
+    return found
+
+
+def _tcp_listeners(pids: set[int]) -> str:
+    """The ``lsof`` lines for TCP sockets in LISTEN state held by *pids*; empty when there are none."""
+    return subprocess.run(
+        ["lsof", "-nP", "-a", "-p", ",".join(map(str, sorted(pids))), "-iTCP", "-sTCP:LISTEN"],
+        capture_output=True,
+        text=True,
+    ).stdout
+
+
+def _worker_logs(logs_dir: Path, instance_key: int | str) -> dict[int, Path]:
+    """Runtime logs by worker pid: a worker of a multi-worker proxy writes ``proxy-<instance key>-<pid>.log``."""
+    prefix = f"proxy-{instance_key}-"
+    return {
+        int(log.name[len(prefix) : -len(".log")]): log for log in logs_dir.glob(f"{prefix}*.log")
+    }
+
+
+def _accepting(path: Path) -> bool:
+    """Whether a connection to *path* succeeds; a worker opens its log before it starts listening."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+        try:
+            probe.connect(str(path))
+        except ConnectionRefusedError:
+            return False
+    return True
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+class TestMultipleWorkers:
+    """``--workers N`` with ``--uds``: uvicorn's supervisor shares the socket this process bound with every worker."""
+
+    def test_worker_config_keeps_the_socket_identity(
+        self, socket_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import json
+
+        from headroom.proxy import server
+
+        parent = ProxyConfig(uds=str(socket_dir / "proxy.sock"), worker_processes=_WORKERS)
+        monkeypatch.setenv(
+            server._MULTI_WORKER_CONFIG_ENV, json.dumps(server._proxy_config_payload(parent))
+        )
+
+        worker = server._proxy_config_from_env()
+
+        assert worker.uds == parent.uds
+        assert worker.instance_key == parent.instance_key
+
+    @pytest.mark.skipif(shutil.which("lsof") is None, reason="needs lsof to list TCP listeners")
+    def test_workers_share_one_owner_only_socket_through_restart_and_sigterm(
+        self, socket_dir: Path, tmp_path: Path
+    ) -> None:
+        path = socket_dir / "h.sock"
+        logs_dir = tmp_path / "logs"
+        instance_key = ProxyConfig(uds=str(path)).instance_key
+        env = dict(os.environ, HEADROOM_WORKSPACE_DIR=str(tmp_path), DO_NOT_TRACK="1")
+        env.pop("HEADROOM_PROXY_CONFIG_JSON", None)
+        # The proxy logs to stderr at INFO; a file never fills up and blocks it the way a pipe can.
+        stderr_log = tmp_path / "stderr.log"
+        with stderr_log.open("wb") as stderr:
+            proc = subprocess.Popen(
+                [sys.executable, "-c", _MULTI_WORKER_SCRIPT, str(path), str(_WORKERS)],
+                cwd=REPO_ROOT,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr,
+            )
+
+        def wait_for_workers(exclude: set[int]) -> set[int]:
+            deadline = time.monotonic() + _WORKER_DEADLINE_SECONDS
+            while True:
+                assert proc.poll() is None, stderr_log.read_text()
+                workers = set(_worker_logs(logs_dir, instance_key)) & _descendants(proc.pid)
+                workers -= exclude
+                if len(workers) == _WORKERS and _accepting(path):
+                    return workers
+                assert time.monotonic() < deadline, f"workers never started; saw {workers}"
+                time.sleep(0.2)
+
+        def wait_until_each_answers(workers: set[int]) -> None:
+            # Requests go to whichever worker accepts first, so keep sending until every worker's own log records one.
+            logs = _worker_logs(logs_dir, instance_key)
+            deadline = time.monotonic() + _WORKER_DEADLINE_SECONDS
+            while True:
+                assert _get(path, "/health").status_code == 200
+                answered = {pid for pid in workers if "path=/health " in logs[pid].read_text()}
+                if answered == workers:
+                    return
+                assert time.monotonic() < deadline, f"only {answered} of {workers} answered"
+
+        try:
+            workers = wait_for_workers(exclude=set())
+            wait_until_each_answers(workers)
+            bound = path.lstat()
+            assert stat.S_IMODE(bound.st_mode) == SOCKET_MODE
+            assert _tcp_listeners({proc.pid} | _descendants(proc.pid)) == ""
+            assert not list(logs_dir.glob(f"proxy-{ProxyConfig().port}*")), (
+                "a worker ran as a TCP proxy on the default port"
+            )
+
+            killed = min(workers)
+            os.kill(killed, signal.SIGKILL)
+            survivors = workers - {killed}
+            replacement = wait_for_workers(exclude={killed}) - survivors
+            assert len(replacement) == 1
+            wait_until_each_answers(survivors | replacement)
+            restarted = path.lstat()
+            assert (restarted.st_dev, restarted.st_ino) == (bound.st_dev, bound.st_ino)
+            assert stat.S_IMODE(restarted.st_mode) == SOCKET_MODE
+            tree = {proc.pid} | _descendants(proc.pid)
+            assert _tcp_listeners(tree) == ""
+
+            proc.send_signal(signal.SIGTERM)
+            proc.wait(timeout=_WORKER_DEADLINE_SECONDS)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+        # uvicorn's multi-worker supervisor returns normally after SIGTERM instead of re-raising it as a single server does, over TCP as well as over a socket.
+        assert proc.returncode == 0, stderr_log.read_text()
+        assert not path.exists()
+        deadline = time.monotonic() + _WORKER_DEADLINE_SECONDS
+        while live := {pid for pid in tree - {proc.pid} if _alive(pid)}:
+            assert time.monotonic() < deadline, f"workers outlived the parent: {live}"
+            time.sleep(0.2)
