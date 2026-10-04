@@ -42,7 +42,7 @@ Disable it with `HEADROOM_BEACON=off`, the `DO_NOT_TRACK=1` convention, or `--of
 
 `headroom proxy --uds /path/to/dir/proxy.sock` serves HTTP on a unix domain socket and binds no TCP port. A local process cannot reach the proxy just by grabbing a free loopback port; only processes allowed by the filesystem can connect. The same flag exists on `python -m headroom.proxy.server`, and programmatic callers set `ProxyConfig(uds=...)`.
 
-- The parent directory must already exist and should be private to the user running the proxy (`mkdir -m 700`). Headroom never creates or chmods it.
+- The parent directory must already exist, be owned by the user running the proxy, and not be writable by group or others (`mkdir -m 700` is the recommended setup). Whoever can write a directory can delete the socket in it and bind their own at the same path, so a directory that fails this check is refused with a one-line error before the banner. A sticky bit (as on `/tmp`) does not substitute: it stops other users removing your entries but not planting one at the path first. Only the parent is inspected, not the directories above it, and Headroom never creates or chmods it.
 - The socket is created with mode `0600`.
 - A relative path is resolved against the current directory and `~` is expanded before anything else, and the banner and the `curl --unix-socket` example show the resolved path. The resolved path must fit the platform's `sockaddr_un` limit (`sun_path` is 104 bytes on macOS and the BSDs and 108 on Linux; the usable length is measured at startup); a longer one is refused with an error naming its length and the limit.
 - `--uds` is refused on a platform without unix domain sockets, such as Windows.

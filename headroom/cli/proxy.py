@@ -1161,8 +1161,8 @@ def proxy(
         # Before anything else: the malloc-tuning re-exec and dependency checks are wasted work when --uds cannot work.
         from headroom.proxy.unix_socket import (
             UnixSocketUnusableError,
+            checked_unix_socket_path,
             require_unix_sockets,
-            resolve_unix_socket_path,
         )
 
         try:
@@ -1352,7 +1352,7 @@ def proxy(
     if uds is not None:
         _refuse_tcp_listen_options_with_uds(ctx)
         try:
-            uds = resolve_unix_socket_path(uds)
+            uds = checked_unix_socket_path(uds)
         except UnixSocketUnusableError as exc:
             raise click.ClickException(str(exc)) from None
 

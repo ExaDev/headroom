@@ -192,8 +192,8 @@ from headroom.proxy.tool_schema_savings_policy import tool_schema_saved_from_tag
 from headroom.proxy.unix_socket import (
     UnixSocketInUseError,
     UnixSocketUnusableError,
+    checked_unix_socket_path,
     require_unix_sockets,
-    resolve_unix_socket_path,
     serving_unix_socket,
 )
 from headroom.proxy.upstream_pinning import install_upstream_pinning
@@ -6681,7 +6681,7 @@ if __name__ == "__main__":
     if args.uds is not None:
         _refuse_tcp_env_with_uds(os.environ)
         try:
-            args.uds = resolve_unix_socket_path(args.uds)
+            args.uds = checked_unix_socket_path(args.uds)
         except UnixSocketUnusableError as exc:
             sys.exit(f"error: {exc}")
     config = ProxyConfig(

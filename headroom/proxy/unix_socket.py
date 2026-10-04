@@ -10,7 +10,7 @@ The socket is bound here and handed to uvicorn as a file descriptor rather than 
 
 Contract with the caller:
 
-* The parent directory must already exist and must be private (mode ``0o700``, owned by the user running the proxy). This module never creates or chmods it; the socket's own ``0o600`` mode is the second layer, not the only one.
+* The parent directory must already exist and must be private to the user running the proxy: owned by the current effective uid and not writable by group or others (``0o700`` is the recommended mode). Whoever can write the directory can unlink the socket and bind their own at the same path, so this is checked, with a one-line error, before anything is bound; a sticky bit does not substitute for it (see :func:`_require_safe_parent`). This module never creates or chmods the directory; the socket's own ``0o600`` mode is the second layer, not the only one. Directories above the parent are not inspected.
 * A socket file left at the path by a process that has exited (nothing accepts connections on it) is removed and replaced. A socket that still accepts connections, or any path that is not a socket, is refused with :class:`UnixSocketInUseError`.
 * Checking for a stale socket and binding are two steps, so two proxies started on the same path at the same instant can race. Supervising a single proxy per path is the caller's job.
 * On clean shutdown the socket file is removed, but only if the path still names the socket this process bound. That includes SIGTERM: uvicorn finishes its graceful shutdown and then re-raises the signal with the previous handler restored, which under the default handler would kill the process before any cleanup ran, so :func:`serving_unix_socket` installs a handler that unwinds the stack instead and re-raises SIGTERM itself once the file is gone.
@@ -111,10 +111,37 @@ def max_socket_path_bytes() -> int:
     return fits
 
 
-def resolve_unix_socket_path(path: str) -> str:
-    """Return the absolute form of *path*, after checking that a socket can be bound there.
+def _require_safe_parent(parent: str, socket_path: str) -> None:
+    """Raise :class:`UnixSocketUnusableError` unless *parent* is a directory only the current user can change.
 
-    ``~`` is expanded and a relative path is resolved against the current directory first, because the limit applies to the path the kernel is handed, not the one the user typed. Raises :class:`UnixSocketUnusableError` when the resolved path is longer than :func:`max_socket_path_bytes`.
+    Write permission on a directory is what allows unlinking or renaming the entries in it, whoever owns them, so a directory that another user owns or that group or others can write to lets them delete the socket and put their own in its place, and a client that trusts the path then talks to them. Both are refused. The sticky bit is not accepted as a substitute: it stops other users removing this user's entries, but they could still plant an entry at the path before the proxy binds, and it is not a property of a private directory.
+    """
+    try:
+        info = os.stat(parent)
+    except FileNotFoundError:
+        raise UnixSocketUnusableError(
+            f"directory {parent} for the socket {socket_path} does not exist; create it with mode 700"
+        ) from None
+    if not stat.S_ISDIR(info.st_mode):
+        raise UnixSocketUnusableError(
+            f"{parent} holds the socket {socket_path} but is not a directory"
+        )
+    if info.st_uid != os.geteuid():
+        raise UnixSocketUnusableError(
+            f"directory {parent} is owned by uid {info.st_uid}, not by the user running the proxy "
+            f"(uid {os.geteuid()}); another owner could replace the socket"
+        )
+    if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise UnixSocketUnusableError(
+            f"directory {parent} is writable by group or others (mode {stat.S_IMODE(info.st_mode):04o}); "
+            "they could replace the socket. Run chmod go-w on it or use a private directory"
+        )
+
+
+def checked_unix_socket_path(path: str) -> str:
+    """Return the absolute form of *path*, after checking that a socket can be bound there safely.
+
+    ``~`` is expanded and a relative path is resolved against the current directory first, because the limit applies to the path the kernel is handed, not the one the user typed. Raises :class:`UnixSocketUnusableError` when the resolved path is longer than :func:`max_socket_path_bytes`, or when its parent directory is missing, not owned by the current effective user, or writable by group or others. The directory is only inspected, never created or chmodded.
     """
     if path == "":
         raise UnixSocketUnusableError("--uds must be a socket path, not an empty string")
@@ -126,6 +153,7 @@ def resolve_unix_socket_path(path: str) -> str:
             f"socket path {resolved} is {length} bytes, longer than the {limit} bytes "
             f"{sys.platform} allows for a unix socket; use a shorter path"
         )
+    _require_safe_parent(os.path.dirname(resolved), resolved)
     return resolved
 
 
@@ -158,9 +186,9 @@ def _remove_stale_socket(path: str) -> None:
 def bind_unix_listener(path: str) -> UnixSocketListener:
     """Bind a stream socket at *path* with mode :data:`SOCKET_MODE`.
 
-    The socket is chmodded before uvicorn calls ``listen()`` on it, so no peer can connect while the file still carries the umask-derived mode. The returned listener's ``path`` is the one resolved by :func:`resolve_unix_socket_path`.
+    The socket is chmodded before uvicorn calls ``listen()`` on it, so no peer can connect while the file still carries the umask-derived mode. The returned listener's ``path`` is the one resolved by :func:`checked_unix_socket_path`.
     """
-    path = resolve_unix_socket_path(path)
+    path = checked_unix_socket_path(path)
     _remove_stale_socket(path)
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
