@@ -260,6 +260,29 @@ def _env_without_tcp_listen_vars() -> dict[str, str]:
     return {k: v for k, v in os.environ.items() if k not in ("HEADROOM_HOST", "HEADROOM_PORT")}
 
 
+class TestCliSocketInUse:
+    def test_live_listener_reported_as_usage_error(self, socket_dir: Path):
+        path = socket_dir / "proxy.sock"
+        live = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        live.bind(str(path))
+        live.listen()
+
+        def run_server_binding(config, **kwargs):
+            bind_unix_listener(config.uds)
+
+        try:
+            with patch("headroom.proxy.server.run_server", run_server_binding):
+                result = CliRunner().invoke(
+                    main,
+                    ["proxy", "--uds", str(path)],
+                    env={"HEADROOM_HOST": None, "HEADROOM_PORT": None},
+                )
+        finally:
+            live.close()
+        assert result.exit_code == 1
+        assert f"Error: another process is already listening on {path}" in result.output
+
+
 class TestModuleEntrypointUdsFlag:
     def test_uds_with_port_refused(self):
         proc = subprocess.run(

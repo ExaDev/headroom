@@ -189,7 +189,7 @@ from headroom.proxy.ssl_context import (
     ensure_process_trust_if_owned,
 )
 from headroom.proxy.tool_schema_savings_policy import tool_schema_saved_from_tags
-from headroom.proxy.unix_socket import serving_unix_socket
+from headroom.proxy.unix_socket import UnixSocketInUseError, serving_unix_socket
 from headroom.proxy.upstream_pinning import install_upstream_pinning
 from headroom.proxy.warmup import WarmupRegistry
 from headroom.proxy.ws_session_registry import WebSocketSessionRegistry
@@ -6775,4 +6775,7 @@ if __name__ == "__main__":
     workers = _get_env_int("HEADROOM_WORKERS", args.workers)
     limit_concurrency = _get_env_int("HEADROOM_LIMIT_CONCURRENCY", args.limit_concurrency)
 
-    run_server(config, workers=workers, limit_concurrency=limit_concurrency)
+    try:
+        run_server(config, workers=workers, limit_concurrency=limit_concurrency)
+    except UnixSocketInUseError as exc:
+        sys.exit(f"error: {exc}")
