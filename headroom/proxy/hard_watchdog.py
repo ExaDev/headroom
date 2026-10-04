@@ -29,7 +29,6 @@ import atexit
 import faulthandler
 import logging
 import os
-import sys
 import threading
 import time
 
@@ -58,11 +57,14 @@ def _resolve_secs() -> float:
     return max(secs, MIN_SECS)
 
 
+#: The process's standard error file descriptor, which supervisors redirect into the proxy log. Armed by number rather than through ``sys.stderr``: that attribute can be replaced at any time by an object with no file descriptor (click's CliRunner, pytest's capture), and ``faulthandler`` then raises, which killed the heartbeat thread and left the last armed timer to exit a healthy process.
+STDERR_FD = 2
+
+
 def _arm(secs: float) -> None:
     # Re-arming replaces the previous timer, so a healthy interpreter never
-    # lets it expire. ``file`` is the underlying stderr fd, which supervisors
-    # already redirect into the proxy log.
-    faulthandler.dump_traceback_later(secs, exit=True, file=sys.stderr)
+    # lets it expire.
+    faulthandler.dump_traceback_later(secs, exit=True, file=STDERR_FD)
 
 
 def _heartbeat(secs: float) -> None:
