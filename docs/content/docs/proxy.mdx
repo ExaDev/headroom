@@ -44,6 +44,8 @@ Disable it with `HEADROOM_BEACON=off`, the `DO_NOT_TRACK=1` convention, or `--of
 
 - The parent directory must already exist and should be private to the user running the proxy (`mkdir -m 700`). Headroom never creates or chmods it.
 - The socket is created with mode `0600`.
+- A relative path is resolved against the current directory and `~` is expanded before anything else, and the banner and the `curl --unix-socket` example show the resolved path. The resolved path must fit the platform's `sockaddr_un` limit (`sun_path` is 104 bytes on macOS and the BSDs and 108 on Linux; the usable length is measured at startup); a longer one is refused with an error naming its length and the limit.
+- `--uds` is refused on a platform without unix domain sockets, such as Windows.
 - A socket left at the path by a process that has exited is replaced. A socket another process is still listening on, or any path that is not a socket, is refused and the proxy exits.
 - The socket file is removed on shutdown (Ctrl+C or SIGTERM), unless something else has replaced it in the meantime.
 - `--uds` cannot be combined with `--host`, `--port`, `HEADROOM_HOST` or `HEADROOM_PORT`.
