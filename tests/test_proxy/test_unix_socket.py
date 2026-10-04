@@ -308,6 +308,25 @@ class TestProxyConfigUds:
             ProxyConfig(uds="")
 
 
+class TestInstanceKeyedState:
+    """A socket proxy keeps its workspace state apart from a TCP proxy on the port it does not use."""
+
+    def test_perf_reader_includes_a_socket_proxy_runtime_log(self, tmp_path: Path, monkeypatch):
+        from headroom import paths
+        from headroom.perf import analyzer
+
+        monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path))
+        log = paths.proxy_log_path(ProxyConfig(uds="/run/a/proxy.sock").instance_key)
+        log.parent.mkdir(parents=True)
+        log.write_text(
+            "2026-08-22 10:00:00,000 - headroom.proxy - INFO - [hr_uds] PERF model=model-UDS\n"
+        )
+
+        report = analyzer.parse_log_files(last_n_hours=0.0)
+
+        assert {r.request_id for r in report.perf_records} == {"hr_uds"}
+
+
 class TestCliUdsFlag:
     def test_banner_and_config_use_the_resolved_path(self, socket_dir: Path, monkeypatch):
         monkeypatch.chdir(socket_dir)
