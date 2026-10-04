@@ -50,7 +50,7 @@ Disable it with `HEADROOM_BEACON=off`, the `DO_NOT_TRACK=1` convention, or `--of
 - The socket file is removed on shutdown (Ctrl+C or SIGTERM), unless something else has replaced it in the meantime.
 - `--uds` cannot be combined with `--host`, `--port`, `HEADROOM_HOST` or `HEADROOM_PORT`.
 - Peers on the socket count as local for the loopback-only `/debug/*` and dashboard routes and are exempt from `HEADROOM_PROXY_TOKEN`, exactly like loopback TCP callers. The `x-headroom-user-id` header is the exception: uvicorn reports no peer address on a unix socket, and identity selection only trusts a peer it can see is loopback, so the header from a socket caller is ignored.
-- Per-instance state that is normally keyed by port (the runtime log, the beacon lock, the embedding sidecar's default socket) is keyed by a hash of the socket path instead.
+- Per-instance state that is normally keyed by port (the runtime log, which `headroom perf` reads, the beacon lock, the embedding sidecar's default socket and the wrap-client markers the orphan watchdog reads) is keyed by a hash of the socket path instead.
 - `HEADROOM_CC_SWITCH_RECONCILE` is refused, since it points Claude Code at a TCP URL.
 
 ```bash
