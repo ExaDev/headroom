@@ -27,7 +27,9 @@ from headroom.proxy.models import ProxyConfig  # noqa: E402
 from headroom.proxy.unix_socket import (  # noqa: E402
     SOCKET_MODE,
     UnixSocketInUseError,
+    UnixSocketUnusableError,
     bind_unix_listener,
+    require_unix_sockets,
 )
 
 pytestmark = pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="needs AF_UNIX")
@@ -309,3 +311,50 @@ class TestModuleEntrypointUdsFlag:
         )
         assert proc.returncode == 1
         assert "--uds cannot be combined with HEADROOM_PORT" in proc.stderr
+
+
+# Python on Windows defines no socket.AF_UNIX. The tests remove the attribute from the socket module rather than run on Windows; everything that uses it is imported first, so only the guard sees it missing.
+_NO_AF_UNIX_SCRIPT = textwrap.dedent(
+    """
+    import runpy, socket, sys
+    import headroom.proxy.server
+    del socket.AF_UNIX
+    sys.argv = ["headroom.proxy.server", "--uds", "proxy.sock"]
+    runpy.run_module("headroom.proxy.server", run_name="__main__")
+    """
+)
+
+
+class TestPlatformWithoutUnixSockets:
+    def test_require_unix_sockets_names_the_platform(self, monkeypatch):
+        monkeypatch.delattr(socket, "AF_UNIX")
+        monkeypatch.setattr(sys, "platform", "win32")
+        with pytest.raises(UnixSocketUnusableError, match="win32 does not provide"):
+            require_unix_sockets()
+
+    def test_cli_refuses_before_any_other_work(self, monkeypatch):
+        monkeypatch.delattr(socket, "AF_UNIX")
+
+        def fail(*args, **kwargs):
+            raise AssertionError("work ran before the AF_UNIX guard")
+
+        monkeypatch.setattr("headroom.cli.proxy._reexec_with_malloc_tuning", fail)
+        monkeypatch.setattr("headroom.cli.proxy.ensure_proxy_dependencies", fail)
+        result = CliRunner().invoke(
+            main,
+            ["proxy", "--uds", "proxy.sock"],
+            env={"HEADROOM_HOST": None, "HEADROOM_PORT": None},
+        )
+        assert result.exit_code == 1
+        assert "Error: --uds needs unix domain sockets" in result.output
+
+    def test_module_entrypoint_refuses(self):
+        proc = subprocess.run(
+            [sys.executable, "-W", "ignore::RuntimeWarning", "-c", _NO_AF_UNIX_SCRIPT],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            env=_env_without_tcp_listen_vars(),
+        )
+        assert proc.returncode == 1
+        assert proc.stderr.strip().startswith("error: --uds needs unix domain sockets")
