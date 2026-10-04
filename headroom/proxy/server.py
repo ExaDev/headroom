@@ -5503,12 +5503,12 @@ def run_server(
     uvicorn_log_level = _resolve_uvicorn_log_level()
 
     if config.uds:
-        from headroom.proxy.uds import bind_uds_listener, prepare_uds_path
+        from headroom.proxy.uds import prepare_uds_path, serving_uds
 
         # Headroom binds the socket and hands uvicorn the descriptor, so the
-        # socket is 0600 before uvicorn listens; see bind_uds_listener().
-        listener = bind_uds_listener(prepare_uds_path(config.uds))
-        try:
+        # socket is 0600 before uvicorn listens and is removed on SIGTERM too;
+        # see bind_uds_listener() and serving_uds().
+        with serving_uds(prepare_uds_path(config.uds)) as listener:
             _run_uvicorn(
                 app_target,
                 {"fd": listener.sock.fileno()},
@@ -5517,8 +5517,6 @@ def run_server(
                 uvicorn_log_level,
                 uvicorn_kwargs,
             )
-        finally:
-            listener.close()
     else:
         _run_uvicorn(
             app_target,

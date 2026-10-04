@@ -28,7 +28,6 @@ from headroom.proxy.uds import (
     bind_uds_listener,
     max_uds_path_length,
     prepare_uds_path,
-    remove_uds_path,
     require_uds_support,
     socket_usage_lines,
 )
@@ -299,6 +298,67 @@ def test_prepare_clears_a_stale_socket(sock_dir: Path) -> None:
     assert not target.exists()
 
 
+# A tiny ASGI app stands in for the real one so the child starts in well under this.
+_SIGTERM_STARTUP_DEADLINE_SECS = 30.0
+
+_SIGTERM_CHILD = """
+import sys
+from unittest.mock import patch
+
+from headroom.proxy.server import ProxyConfig, run_server
+
+
+async def app(scope, receive, send):
+    if scope["type"] == "http":
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+
+with patch("headroom.proxy.server.create_app", return_value=app):
+    run_server(ProxyConfig(uds=sys.argv[1]), print_banner=False)
+"""
+
+
+@requires_uds
+@requires_core
+def test_sigterm_removes_the_socket_and_still_exits_by_signal(sock_dir: Path) -> None:
+    """uvicorn re-raises SIGTERM after shutdown, which under the default handler skips every finally block."""
+    import signal
+    import subprocess
+    import sys
+    import time
+
+    target = sock_dir / "headroom.sock"
+    child = subprocess.Popen(  # noqa: S603
+        [sys.executable, "-c", _SIGTERM_CHILD, str(target)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        deadline = time.monotonic() + _SIGTERM_STARTUP_DEADLINE_SECS
+        while True:
+            assert child.poll() is None, child.stderr.read().decode() if child.stderr else ""
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                probe.connect(str(target))
+                break
+            except OSError:
+                assert time.monotonic() < deadline, "the proxy never started listening"
+                time.sleep(0.1)
+            finally:
+                probe.close()
+
+        child.send_signal(signal.SIGTERM)
+        returncode = child.wait(timeout=_SIGTERM_STARTUP_DEADLINE_SECS)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+
+    assert returncode == -signal.SIGTERM
+    assert not target.exists(), "the socket file must not outlive the proxy"
+
+
 @requires_uds
 def test_prepare_refuses_a_live_socket(sock_dir: Path) -> None:
     """Two proxies on one socket would silently steal each other's traffic."""
@@ -366,21 +426,31 @@ def test_bound_socket_is_owner_only_in_a_shared_parent(sock_dir: Path, parent_mo
 
 
 @requires_uds
-def test_remove_uds_path_is_socket_only(sock_dir: Path) -> None:
-    """Cleanup runs in a finally block, so it must be narrow and never raise."""
-    sock_path = sock_dir / "gone.sock"
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.bind(str(sock_path))
-    sock.close()
-    regular = sock_dir / "keep.txt"
-    regular.write_text("keep", encoding="utf-8")
+def test_close_leaves_a_successors_socket_alone(sock_dir: Path) -> None:
+    """Once this proxy stops accepting, a successor may replace its socket; shutdown must not unlink that one."""
+    target = sock_dir / "headroom.sock"
+    listener = bind_uds_listener(prepare_uds_path(target))
+    listener.sock.close()  # stopped accepting: the file now looks stale
+    successor = bind_uds_listener(prepare_uds_path(target))
+    try:
+        listener.close()
 
-    remove_uds_path(sock_path)
-    remove_uds_path(regular)
-    remove_uds_path(sock_dir / "does-not-exist.sock")
+        assert target.is_socket(), "the successor's socket must survive"
+    finally:
+        successor.close()
 
-    assert not sock_path.exists()
-    assert regular.exists()
+    assert not target.exists()
+
+
+@requires_uds
+def test_close_tolerates_an_already_removed_file(sock_dir: Path) -> None:
+    target = sock_dir / "headroom.sock"
+    listener = bind_uds_listener(prepare_uds_path(target))
+    target.unlink()
+
+    listener.close()
+
+    assert not target.exists()
 
 
 # --------------------------------------------------------------------------

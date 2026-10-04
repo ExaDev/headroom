@@ -30,11 +30,16 @@ from __future__ import annotations
 
 import errno
 import os
+import signal
 import socket
 import stat
 import sys
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from types import FrameType
 
 __all__ = [
     "SOCKET_MODE",
@@ -45,8 +50,8 @@ __all__ = [
     "socket_usage_lines",
     "max_uds_path_length",
     "prepare_uds_path",
-    "remove_uds_path",
     "require_uds_support",
+    "serving_uds",
 ]
 
 # ``AF_UNIX`` is absent from CPython on Windows even where the OS supports the
@@ -269,15 +274,30 @@ def prepare_uds_path(path: str | os.PathLike[str], *, platform: str | None = Non
 
 @dataclass
 class UdsListener:
-    """A bound, not yet listening, stream socket at *path* with mode :data:`SOCKET_MODE`."""
+    """A bound, not yet listening, stream socket at *path* with mode :data:`SOCKET_MODE`.
+
+    *device* and *inode* identify the socket file this listener created, so
+    :meth:`close` can tell it apart from a successor's socket at the same path.
+    """
 
     path: Path
     sock: socket.socket
+    device: int
+    inode: int
 
     def close(self) -> None:
-        """Close the socket and remove its file."""
+        """Close the socket and remove its file if the path still names this socket.
+
+        A successor proxy may have replaced the file once this one stopped
+        accepting connections (it then looks stale); that socket is left alone.
+        """
         self.sock.close()
-        remove_uds_path(self.path)
+        try:
+            current = self.path.lstat()
+        except FileNotFoundError:
+            return
+        if (current.st_dev, current.st_ino) == (self.device, self.inode):
+            self.path.unlink()
 
 
 def bind_uds_listener(path: Path) -> UdsListener:
@@ -294,21 +314,46 @@ def bind_uds_listener(path: Path) -> UdsListener:
     try:
         sock.bind(str(path))
         os.chmod(path, SOCKET_MODE)
+        bound = path.lstat()
     except BaseException:
         sock.close()
         raise
-    return UdsListener(path=path, sock=sock)
+    return UdsListener(path=path, sock=sock, device=bound.st_dev, inode=bound.st_ino)
 
 
-def remove_uds_path(path: str | os.PathLike[str]) -> None:
-    """Unlink *path* if it is still a socket. Never raises.
+class _Terminated(BaseException):
+    """Raised by the SIGTERM handler; a BaseException so ``except Exception`` cannot swallow it."""
 
-    uvicorn removes its own socket on a clean shutdown; this covers the paths
-    where it does not get the chance.
+
+def _raise_terminated(signum: int, frame: FrameType | None) -> None:
+    raise _Terminated
+
+
+@contextmanager
+def serving_uds(path: Path) -> Iterator[UdsListener]:
+    """Bind *path* for the duration of the block and remove the socket file when it exits.
+
+    uvicorn (0.29 and later) finishes a graceful shutdown on SIGTERM and then
+    re-raises the signal with the previous handler restored. Under the default
+    handler that kills the process before any ``finally`` runs, leaving the
+    socket file behind. So on the main thread this installs a SIGTERM handler
+    that unwinds the block instead, removes the file, and then re-raises SIGTERM
+    under the handler that was in place before, so the process still ends the
+    way it would have (exit status 143 under the default handler). Off the main
+    thread ``signal.signal`` is unavailable and uvicorn neither captures nor
+    re-raises signals, so no handler is installed there.
     """
+    listener = bind_uds_listener(path)
+    on_main_thread = threading.current_thread() is threading.main_thread()
+    previous = signal.signal(signal.SIGTERM, _raise_terminated) if on_main_thread else None
+    terminated = False
     try:
-        target = Path(path)
-        if target.is_socket():
-            target.unlink()
-    except OSError:
-        pass
+        yield listener
+    except _Terminated:
+        terminated = True
+    finally:
+        if on_main_thread:
+            signal.signal(signal.SIGTERM, previous)
+        listener.close()
+    if terminated:
+        signal.raise_signal(signal.SIGTERM)
