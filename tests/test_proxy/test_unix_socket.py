@@ -163,12 +163,16 @@ class TestBindUnixListener:
         stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         stale.bind(str(path))
         stale.close()
-        stale_inode = path.stat().st_ino
 
         listener = bind_unix_listener(str(path))
         try:
-            assert path.stat().st_ino != stale_inode
             assert stat.S_IMODE(path.stat().st_mode) == SOCKET_MODE
+            # The path now reaches the new socket: a client connects and the listener accepts it. Inode numbers cannot show this, because Linux reuses them after unlink.
+            listener.sock.listen()
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.connect(str(path))
+                accepted, _ = listener.sock.accept()
+                accepted.close()
         finally:
             listener.close()
         assert not path.exists()
