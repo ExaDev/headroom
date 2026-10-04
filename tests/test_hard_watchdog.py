@@ -68,6 +68,37 @@ _HEALTHY = textwrap.dedent(
 )
 
 
+# Something replaces sys.stderr with an object that has no file descriptor (click's CliRunner and pytest's capture both do), before and after the watchdog is armed. A watchdog that re-read sys.stderr would fail to arm or lose its heartbeat thread, and the timer it armed last would then exit a healthy process.
+_STDERR_REPLACED = textwrap.dedent(
+    """
+    import io, sys, time
+    from headroom.proxy.hard_watchdog import start_hard_watchdog
+
+    real_stderr = sys.stderr
+    sys.stderr = io.StringIO()
+    assert start_hard_watchdog()
+    sys.stderr = real_stderr
+    time.sleep(1)
+    sys.stderr = io.StringIO()
+    time.sleep(12)  # well past the 5s deadline and several heartbeats
+    print("SURVIVED", flush=True)
+    """
+)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="keep the set symmetric")
+def test_replaced_sys_stderr_does_not_stop_the_heartbeat():
+    proc = subprocess.run(
+        [sys.executable, "-c", _STDERR_REPLACED],
+        env={"HEADROOM_HARD_WATCHDOG_SECS": "5", "PATH": "/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+        timeout=40,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "SURVIVED" in proc.stdout
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="libc lookup is POSIX-only")
 def test_seized_gil_is_dumped_and_exited():
     proc = subprocess.run(
