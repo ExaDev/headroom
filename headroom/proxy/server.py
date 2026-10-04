@@ -191,7 +191,12 @@ from headroom.proxy.ssl_context import (
 )
 from headroom.proxy.tcp_keepalive import install_tcp_keepalive
 from headroom.proxy.tool_schema_savings_policy import tool_schema_saved_from_tags
-from headroom.proxy.unix_socket import UnixSocketInUseError, serving_unix_socket
+from headroom.proxy.unix_socket import (
+    UnixSocketInUseError,
+    UnixSocketUnusableError,
+    require_unix_sockets,
+    serving_unix_socket,
+)
 from headroom.proxy.upstream_pinning import install_upstream_pinning
 from headroom.proxy.warmup import WarmupRegistry
 from headroom.proxy.ws_session_registry import WebSocketSessionRegistry
@@ -6790,6 +6795,12 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+
+    if args.uds is not None:
+        try:
+            require_unix_sockets()
+        except UnixSocketUnusableError as exc:
+            sys.exit(f"error: {exc}")
 
     # Environment variable defaults (HEADROOM_* prefix)
     # CLI args override env vars, env vars override ProxyConfig defaults

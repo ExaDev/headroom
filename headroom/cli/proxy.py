@@ -1170,6 +1170,15 @@ def proxy(
     Usage with OpenAI-compatible clients:
         OPENAI_BASE_URL=http://localhost:8787/v1 your-app
     """
+    if uds is not None:
+        # Before anything else: the malloc-tuning re-exec and dependency checks are wasted work when --uds cannot work.
+        from headroom.proxy.unix_socket import UnixSocketUnusableError, require_unix_sockets
+
+        try:
+            require_unix_sockets()
+        except UnixSocketUnusableError as exc:
+            raise click.ClickException(str(exc)) from None
+
     _reexec_with_malloc_tuning()
     ensure_proxy_dependencies()
 
