@@ -634,6 +634,21 @@ def _accepting(path: Path) -> bool:
     return True
 
 
+def _kill_tree(proc: subprocess.Popen[bytes]) -> None:
+    """Stop *proc* and every process under it.
+
+    uvicorn's workers outlive a supervisor killed with SIGKILL and keep serving the socket, so killing only the parent would leak them. The supervisor is stopped first so it cannot replace a worker while the workers are killed.
+    """
+    os.kill(proc.pid, signal.SIGSTOP)
+    for pid in _descendants(proc.pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:  # it exited after the listing
+            pass
+    proc.kill()
+    proc.wait()
+
+
 def _alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -730,8 +745,7 @@ class TestMultipleWorkers:
             proc.wait(timeout=_WORKER_DEADLINE_SECONDS)
         finally:
             if proc.poll() is None:
-                proc.kill()
-                proc.wait()
+                _kill_tree(proc)
 
         # uvicorn's multi-worker supervisor returns normally after SIGTERM instead of re-raising it as a single server does, over TCP as well as over a socket.
         assert proc.returncode == 0, stderr_log.read_text()
