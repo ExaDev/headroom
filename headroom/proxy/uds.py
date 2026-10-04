@@ -61,6 +61,9 @@ UDS_SUPPORTED = _AF_UNIX != -1
 # ``sockaddr_un.sun_path`` is a fixed-size buffer: 108 bytes on Linux, 104 on
 # the BSDs and macOS. Overrunning it fails inside bind() with a bare ENAMETOOLONG
 # that says nothing about which path was too long, so check it up front.
+# Root may unlink anything anyway, so a root-owned parent adds no exposure.
+_ROOT_UID = 0
+
 _SUN_PATH_MAX_LINUX = 108
 _SUN_PATH_MAX_BSD = 104
 
@@ -160,14 +163,30 @@ def _require_safe_existing_parent(parent: Path) -> None:
     something else owns its policy — silently tightening a shared directory
     would lock out whatever put it there.
 
+    The parent must be owned by the effective user or by root. A directory's
+    owner can unlink or rename any entry in it, sticky bit or not, so another
+    user's directory lets that user swap the socket whatever its mode. Root is
+    accepted because root can do that to any directory anyway, and shared roots
+    such as ``/tmp`` and ``/run`` are root-owned.
+
     Group/world-writable is tolerated when the sticky bit is set, which is the
     ``/tmp`` case: others may create their own entries but cannot unlink or
     rename ours, so the socket cannot be swapped out from under us.
     """
     try:
-        mode = parent.stat().st_mode
+        parent_stat = parent.stat()
     except OSError:
         return  # unreadable; bind() will produce the authoritative error
+
+    euid = os.geteuid()
+    if parent_stat.st_uid not in (euid, _ROOT_UID):
+        raise UdsError(
+            f"{parent} is owned by uid {parent_stat.st_uid}, not by you (uid {euid}) or "
+            "root, so its owner could replace the socket inside it. Point --uds at a "
+            "directory you own."
+        )
+
+    mode = parent_stat.st_mode
 
     if not mode & (stat.S_IWGRP | stat.S_IWOTH):
         return

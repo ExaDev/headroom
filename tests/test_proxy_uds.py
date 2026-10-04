@@ -114,8 +114,9 @@ def test_missing_ancestors_is_empty_for_an_existing_dir(sock_dir: Path) -> None:
 
 
 class _FakeStat:
-    def __init__(self, mode: int) -> None:
+    def __init__(self, mode: int, uid: int | None = None) -> None:
         self.st_mode = mode
+        self.st_uid = os.geteuid() if uid is None else uid
 
 
 @pytest.mark.parametrize(
@@ -130,15 +131,34 @@ class _FakeStat:
         (0o1770, True),  # sticky group-writable
     ],
 )
+@requires_uds
 def test_existing_parent_accepted_only_when_others_cannot_swap_the_socket(
     sock_dir: Path, mode: int, accepted: bool
 ) -> None:
-    """Windows chmod is a no-op, so the mode is injected rather than applied."""
+    """The mode is injected rather than applied, so every case runs without chmod."""
     with patch.object(Path, "stat", return_value=_FakeStat(stat.S_IFDIR | mode)):
         if accepted:
             _require_safe_existing_parent(sock_dir)
         else:
             with pytest.raises(UdsError, match="writable by other users"):
+                _require_safe_existing_parent(sock_dir)
+
+
+@requires_uds
+@pytest.mark.parametrize(
+    ("owner", "accepted"),
+    [("self", True), ("root", True), ("other", False)],
+)
+def test_existing_parent_must_be_owned_by_us_or_root(
+    sock_dir: Path, owner: str, accepted: bool
+) -> None:
+    """A directory's owner can unlink any entry in it, so another user's 0700 directory is not private to us."""
+    uid = {"self": os.geteuid(), "root": 0, "other": os.geteuid() + 1}[owner]
+    with patch.object(Path, "stat", return_value=_FakeStat(stat.S_IFDIR | 0o700, uid)):
+        if accepted:
+            _require_safe_existing_parent(sock_dir)
+        else:
+            with pytest.raises(UdsError, match="is owned by uid"):
                 _require_safe_existing_parent(sock_dir)
 
 
