@@ -7,8 +7,11 @@ Claude Code's Remote Control (GH #1779).
 
 from __future__ import annotations
 
+import shutil
 import socket
 import stat
+import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import patch
 
@@ -31,6 +34,18 @@ from headroom.proxy.uds import (
 requires_uds = pytest.mark.skipif(
     not UDS_SUPPORTED, reason="platform has no socket.AF_UNIX (Windows)"
 )
+
+# The POSIX temp root. pytest's tmp_path lives under $TMPDIR, which on macOS is a per-user /var/folders/... path deep enough that a socket nested a few levels below it overruns the 104-byte sun_path limit, so the bind-level tests would fail for a reason unrelated to the code under test.
+_SHORT_TEMP_ROOT = "/tmp"
+
+
+@pytest.fixture
+def sock_dir() -> Iterator[Path]:
+    """A fresh private directory whose paths fit in sun_path on every POSIX platform."""
+    path = Path(tempfile.mkdtemp(prefix="hr-uds-", dir=_SHORT_TEMP_ROOT))
+    yield path
+    shutil.rmtree(path)
+
 
 try:  # `headroom.proxy.server` pulls in the compiled Rust core.
     import headroom._core  # noqa: F401
@@ -82,9 +97,9 @@ def test_cli_rejects_uds_on_windows() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_missing_ancestors_lists_only_absent_levels(tmp_path: Path) -> None:
+def test_missing_ancestors_lists_only_absent_levels(sock_dir: Path) -> None:
     """Only these get chmod 0700; anything already on disk is left alone."""
-    existing = tmp_path / "existing"
+    existing = sock_dir / "existing"
     existing.mkdir()
 
     missing = _missing_ancestors(existing / "a" / "b")
@@ -92,8 +107,8 @@ def test_missing_ancestors_lists_only_absent_levels(tmp_path: Path) -> None:
     assert missing == [existing / "a", existing / "a" / "b"]
 
 
-def test_missing_ancestors_is_empty_for_an_existing_dir(tmp_path: Path) -> None:
-    assert _missing_ancestors(tmp_path) == []
+def test_missing_ancestors_is_empty_for_an_existing_dir(sock_dir: Path) -> None:
+    assert _missing_ancestors(sock_dir) == []
 
 
 class _FakeStat:
@@ -114,21 +129,21 @@ class _FakeStat:
     ],
 )
 def test_existing_parent_accepted_only_when_others_cannot_swap_the_socket(
-    tmp_path: Path, mode: int, accepted: bool
+    sock_dir: Path, mode: int, accepted: bool
 ) -> None:
     """Windows chmod is a no-op, so the mode is injected rather than applied."""
     with patch.object(Path, "stat", return_value=_FakeStat(stat.S_IFDIR | mode)):
         if accepted:
-            _require_safe_existing_parent(tmp_path)
+            _require_safe_existing_parent(sock_dir)
         else:
             with pytest.raises(UdsError, match="writable by other users"):
-                _require_safe_existing_parent(tmp_path)
+                _require_safe_existing_parent(sock_dir)
 
 
-def test_unreadable_existing_parent_defers_to_bind(tmp_path: Path) -> None:
+def test_unreadable_existing_parent_defers_to_bind(sock_dir: Path) -> None:
     """A stat we cannot perform is not evidence of a problem; let bind() rule."""
     with patch.object(Path, "stat", side_effect=PermissionError):
-        _require_safe_existing_parent(tmp_path)
+        _require_safe_existing_parent(sock_dir)
 
 
 # --------------------------------------------------------------------------
@@ -177,9 +192,9 @@ def test_socket_usage_lines_name_no_agent() -> None:
 
 
 @requires_uds
-def test_prepare_creates_parent_owner_only(tmp_path: Path) -> None:
+def test_prepare_creates_parent_owner_only(sock_dir: Path) -> None:
     """The directory mode is the access-control boundary for the socket."""
-    target = tmp_path / "run" / "headroom.sock"
+    target = sock_dir / "run" / "headroom.sock"
 
     resolved = prepare_uds_path(target)
 
@@ -189,14 +204,14 @@ def test_prepare_creates_parent_owner_only(tmp_path: Path) -> None:
 
 
 @requires_uds
-def test_prepare_preserves_an_existing_parents_mode(tmp_path: Path) -> None:
+def test_prepare_preserves_an_existing_parents_mode(sock_dir: Path) -> None:
     """A caller-owned directory must not be silently tightened to 0700.
 
     Regression test: `--uds /run/shared/hr.sock` where `/run/shared` is a
     directory someone else set up at 0755 would have locked out every other
     user of that directory.
     """
-    parent = tmp_path / "shared"
+    parent = sock_dir / "shared"
     parent.mkdir()
     parent.chmod(0o755)
     bystander = parent / "someone-elses.txt"
@@ -209,9 +224,9 @@ def test_prepare_preserves_an_existing_parents_mode(tmp_path: Path) -> None:
 
 
 @requires_uds
-def test_prepare_only_chmods_directories_it_creates(tmp_path: Path) -> None:
+def test_prepare_only_chmods_directories_it_creates(sock_dir: Path) -> None:
     """The 0700 applies to the new levels, not to the existing root above them."""
-    root = tmp_path / "existing"
+    root = sock_dir / "existing"
     root.mkdir()
     root.chmod(0o755)
 
@@ -223,9 +238,9 @@ def test_prepare_only_chmods_directories_it_creates(tmp_path: Path) -> None:
 
 
 @requires_uds
-def test_prepare_refuses_a_world_writable_existing_parent(tmp_path: Path) -> None:
+def test_prepare_refuses_a_world_writable_existing_parent(sock_dir: Path) -> None:
     """Without the sticky bit, any local user could swap the socket out."""
-    parent = tmp_path / "open"
+    parent = sock_dir / "open"
     parent.mkdir()
     parent.chmod(0o777)
 
@@ -236,9 +251,9 @@ def test_prepare_refuses_a_world_writable_existing_parent(tmp_path: Path) -> Non
 
 
 @requires_uds
-def test_prepare_accepts_a_sticky_world_writable_parent(tmp_path: Path) -> None:
+def test_prepare_accepts_a_sticky_world_writable_parent(sock_dir: Path) -> None:
     """`/tmp` is 1777: others can add entries but cannot unlink ours."""
-    parent = tmp_path / "sticky"
+    parent = sock_dir / "sticky"
     parent.mkdir()
     parent.chmod(0o1777)
 
@@ -249,9 +264,9 @@ def test_prepare_accepts_a_sticky_world_writable_parent(tmp_path: Path) -> None:
 
 
 @requires_uds
-def test_prepare_clears_a_stale_socket(tmp_path: Path) -> None:
+def test_prepare_clears_a_stale_socket(sock_dir: Path) -> None:
     """A crashed proxy leaves an inode behind; a restart must not trip on it."""
-    target = tmp_path / "stale.sock"
+    target = sock_dir / "stale.sock"
     dead = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     dead.bind(str(target))
     dead.close()  # closing without unlinking is exactly the crash case
@@ -263,9 +278,9 @@ def test_prepare_clears_a_stale_socket(tmp_path: Path) -> None:
 
 
 @requires_uds
-def test_prepare_refuses_a_live_socket(tmp_path: Path) -> None:
+def test_prepare_refuses_a_live_socket(sock_dir: Path) -> None:
     """Two proxies on one socket would silently steal each other's traffic."""
-    target = tmp_path / "live.sock"
+    target = sock_dir / "live.sock"
     live = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     live.bind(str(target))
     live.listen(1)
@@ -279,9 +294,9 @@ def test_prepare_refuses_a_live_socket(tmp_path: Path) -> None:
 
 
 @requires_uds
-def test_prepare_never_deletes_a_regular_file(tmp_path: Path) -> None:
+def test_prepare_never_deletes_a_regular_file(sock_dir: Path) -> None:
     """A typo'd --uds pointing at real data must not destroy it."""
-    target = tmp_path / "notes.txt"
+    target = sock_dir / "notes.txt"
     target.write_text("important", encoding="utf-8")
 
     with pytest.raises(UdsError, match="is not a socket"):
@@ -291,27 +306,39 @@ def test_prepare_never_deletes_a_regular_file(tmp_path: Path) -> None:
 
 
 @requires_uds
-def test_prepare_rejects_an_oversized_path(tmp_path: Path) -> None:
+def test_prepare_rejects_an_oversized_path(sock_dir: Path) -> None:
     """Past sun_path, bind() fails with an ENAMETOOLONG that names nothing."""
-    target = tmp_path / ("d" * 120) / "headroom.sock"
+    target = sock_dir / ("d" * 120) / "headroom.sock"
 
     with pytest.raises(UdsError, match="sun_path limit"):
         prepare_uds_path(target)
 
 
 @requires_uds
-def test_remove_uds_path_is_socket_only(tmp_path: Path) -> None:
+def test_oversized_path_advice_does_not_point_at_tmpdir(sock_dir: Path) -> None:
+    """On macOS $TMPDIR is a deep per-user /var/folders path, so advising it sends users somewhere that fails the same check."""
+    target = sock_dir / ("d" * 120) / "headroom.sock"
+
+    with pytest.raises(UdsError) as excinfo:
+        prepare_uds_path(target)
+
+    assert "under $TMPDIR" not in str(excinfo.value)
+    assert "/tmp" in str(excinfo.value)
+
+
+@requires_uds
+def test_remove_uds_path_is_socket_only(sock_dir: Path) -> None:
     """Cleanup runs in a finally block, so it must be narrow and never raise."""
-    sock_path = tmp_path / "gone.sock"
+    sock_path = sock_dir / "gone.sock"
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.bind(str(sock_path))
     sock.close()
-    regular = tmp_path / "keep.txt"
+    regular = sock_dir / "keep.txt"
     regular.write_text("keep", encoding="utf-8")
 
     remove_uds_path(sock_path)
     remove_uds_path(regular)
-    remove_uds_path(tmp_path / "does-not-exist.sock")
+    remove_uds_path(sock_dir / "does-not-exist.sock")
 
     assert not sock_path.exists()
     assert regular.exists()
@@ -356,9 +383,9 @@ def test_run_server_binds_host_and_port_by_default() -> None:
 
 @requires_uds
 @requires_core
-def test_run_server_binds_the_socket_instead_of_a_port(tmp_path: Path) -> None:
+def test_run_server_binds_the_socket_instead_of_a_port(sock_dir: Path) -> None:
     """uvicorn treats uds and host/port as alternatives; passing both is an error."""
-    target = tmp_path / "headroom.sock"
+    target = sock_dir / "headroom.sock"
 
     bind = _bind_kwargs_for(host="127.0.0.1", port=9123, uds=str(target))
 
@@ -368,11 +395,11 @@ def test_run_server_binds_the_socket_instead_of_a_port(tmp_path: Path) -> None:
 
 @requires_uds
 @requires_core
-def test_run_server_removes_the_socket_on_exit(tmp_path: Path) -> None:
+def test_run_server_removes_the_socket_on_exit(sock_dir: Path) -> None:
     """A crash inside uvicorn must not leave an inode that blocks the restart."""
     from headroom.proxy.server import ProxyConfig, run_server
 
-    target = tmp_path / "headroom.sock"
+    target = sock_dir / "headroom.sock"
 
     def bind_then_fail(  # noqa: ANN202
         app_target,  # noqa: ANN001

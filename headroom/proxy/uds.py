@@ -214,7 +214,8 @@ def prepare_uds_path(path: str | os.PathLike[str], *, platform: str | None = Non
     if encoded > limit:
         raise UdsError(
             f"Socket path is {encoded} bytes, over this platform's {limit}-byte "
-            f"sun_path limit: {resolved}. Use a shorter path, e.g. under $TMPDIR."
+            f"sun_path limit: {resolved}. Use a shorter path, e.g. a private "
+            "directory under /tmp (on macOS $TMPDIR is itself too deep to fit)."
         )
 
     _prepare_parent_dir(resolved.parent)
