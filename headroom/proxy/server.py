@@ -2600,7 +2600,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # once across all workers instead of N times.
     from headroom import paths as _hr_paths
 
-    _beacon_lock_path = _hr_paths.beacon_lock_path(config.port)
+    _beacon_lock_path = _hr_paths.beacon_lock_path(config.instance_key)
     _beacon_lock_fd: list = [None]  # mutable holder for the lock file descriptor
     _beacon_is_owner: list = [False]
 

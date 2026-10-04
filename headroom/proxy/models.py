@@ -6,6 +6,7 @@ Extracted from server.py to keep the codebase maintainable.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import sys
 from dataclasses import InitVar, dataclass, field
@@ -527,6 +528,22 @@ class ProxyConfig:
     # Process-local runtime hot reload is unsafe above one worker because only
     # the worker receiving the admin request would observe the update.
     worker_processes: int = 1
+
+    @property
+    def instance_key(self) -> int | str:
+        """Identity of this proxy instance for per-instance state (beacon lock, embedding sidecar socket).
+
+        The TCP port for a TCP listener. For a Unix socket listener, ``uds-``
+        followed by the SHA-256 of the socket's absolute path, so socket proxies
+        never share state with each other or with a TCP proxy on ``port``,
+        which a socket listener does not use.
+        """
+        if self.uds is None:
+            return self.port
+        from headroom.proxy.uds import resolve_uds_path
+
+        digest = hashlib.sha256(str(resolve_uds_path(self.uds)).encode("utf-8")).hexdigest()
+        return f"uds-{digest}"
 
     def __post_init__(self, smart_routing: bool | None = None) -> None:
         if self.rollout is None:

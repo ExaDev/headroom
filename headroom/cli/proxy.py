@@ -6,7 +6,7 @@ import sys
 import warnings
 from importlib import import_module
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import click
 
@@ -19,6 +19,9 @@ from headroom.providers.registry import (
 from headroom.proxy.modes import PROXY_MODE_CACHE, normalize_proxy_mode
 
 from .main import main
+
+if TYPE_CHECKING:
+    from headroom.proxy.models import ProxyConfig
 
 
 def ensure_proxy_dependencies() -> None:
@@ -193,6 +196,11 @@ def _get_env_float_optional(name: str) -> float | None:
         return float(val)
     except ValueError:
         raise click.ClickException(f"{name} must be a number, got {val!r}") from None
+
+
+def default_embedding_socket(config: "ProxyConfig") -> str:
+    """Default embedding sidecar socket path, keyed by ``config.instance_key`` so concurrent proxies never share a sidecar."""
+    return f"/tmp/headroom-embed-{config.instance_key}.sock"
 
 
 @main.command()
@@ -1000,7 +1008,8 @@ def dashboard(port: int, no_open: bool) -> None:
     "--embedding-server-socket",
     default=None,
     help="Unix socket path for the embedding server sidecar. "
-    "Default: /tmp/headroom-embed-{port}.sock. "
+    "Default: /tmp/headroom-embed-{port}.sock, with a uds-<hash> key in place of the port "
+    "under --uds. "
     "(env: HEADROOM_EMBEDDING_SERVER_SOCKET)",
 )
 @click.option(
@@ -1626,7 +1635,7 @@ Memory (Multi-Provider):
 
     # Performance tuning section — only shown when at least one tuning var is active.
     _embed_socket = os.environ.get("HEADROOM_EMBEDDING_SERVER_SOCKET") or (
-        embedding_server and (embedding_server_socket or f"/tmp/headroom-embed-{port}.sock")
+        embedding_server and (embedding_server_socket or default_embedding_socket(config))
     )
     _tuning_lines: list[str] = []
     if _embed_socket:
@@ -1710,7 +1719,7 @@ Press Ctrl+C to stop.
     # -----------------------------------------------------------------------
     _embed_watchdog = None
     if embedding_server:
-        _embed_socket = embedding_server_socket or f"/tmp/headroom-embed-{config.port}.sock"
+        _embed_socket = embedding_server_socket or default_embedding_socket(config)
         # Pass socket path to all worker processes via environment variable
         os.environ["HEADROOM_EMBEDDING_SERVER_SOCKET"] = _embed_socket
         click.echo(f"  Embedding server: starting sidecar on {_embed_socket}...")

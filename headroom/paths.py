@@ -336,10 +336,10 @@ def deploy_root() -> Path:
     return workspace_dir() / _DEPLOY_DIR
 
 
-def beacon_lock_path(port: int) -> Path:
-    """Return the per-port proxy beacon lock file path."""
+def beacon_lock_path(instance_key: int | str) -> Path:
+    """Return the per-instance proxy beacon lock file path, keyed by ``ProxyConfig.instance_key``."""
 
-    return workspace_dir() / f".beacon_lock_{int(port)}"
+    return workspace_dir() / f".beacon_lock_{instance_key}"
 
 
 def proxy_start_lock_path(port: int) -> Path:

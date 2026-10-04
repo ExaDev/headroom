@@ -51,6 +51,7 @@ __all__ = [
     "max_uds_path_length",
     "prepare_uds_path",
     "require_uds_support",
+    "resolve_uds_path",
     "serving_uds",
 ]
 
@@ -223,6 +224,14 @@ def _prepare_parent_dir(parent: Path) -> None:
             pass
 
 
+def resolve_uds_path(path: str | os.PathLike[str]) -> Path:
+    """The absolute form of a ``--uds`` argument: ``~`` expanded, a relative path anchored at the working directory."""
+    resolved = Path(path).expanduser()
+    if not resolved.is_absolute():
+        resolved = (Path.cwd() / resolved).resolve()
+    return resolved
+
+
 def prepare_uds_path(path: str | os.PathLike[str], *, platform: str | None = None) -> Path:
     """Validate *path*, create its parent ``0700``, and clear a stale socket.
 
@@ -240,9 +249,7 @@ def prepare_uds_path(path: str | os.PathLike[str], *, platform: str | None = Non
     """
     require_uds_support(platform)
 
-    resolved = Path(path).expanduser()
-    if not resolved.is_absolute():
-        resolved = (Path.cwd() / resolved).resolve()
+    resolved = resolve_uds_path(path)
 
     limit = max_uds_path_length(platform)
     encoded = len(str(resolved).encode("utf-8")) + 1  # + trailing NUL

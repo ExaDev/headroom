@@ -534,3 +534,51 @@ def test_run_server_removes_the_socket_on_exit(sock_dir: Path) -> None:
         run_server(ProxyConfig(uds=str(target)), print_banner=False)
 
     assert not target.exists()
+
+
+# --------------------------------------------------------------------------
+# Per-instance state: a socket proxy is not identified by the port it ignores.
+# --------------------------------------------------------------------------
+
+
+@requires_core
+def test_instance_key_separates_socket_proxies_from_each_other_and_from_tcp() -> None:
+    from headroom.proxy.models import ProxyConfig
+
+    tcp = ProxyConfig(port=8787)
+    first = ProxyConfig(port=8787, uds="/tmp/hr-a/proxy.sock")
+    second = ProxyConfig(port=8787, uds="/tmp/hr-b/proxy.sock")
+
+    assert tcp.instance_key == 8787
+    keys = {tcp.instance_key, first.instance_key, second.instance_key}
+    assert len(keys) == 3
+    assert str(first.instance_key).startswith("uds-")
+
+
+@requires_core
+def test_socket_proxy_state_is_not_named_after_the_ignored_port(sock_dir: Path) -> None:
+    """`--uds X --port 8798` must not name its beacon lock or sidecar socket after 8798."""
+    from headroom import paths
+    from headroom.cli.proxy import default_embedding_socket
+    from headroom.proxy.models import ProxyConfig
+
+    config = ProxyConfig(port=8798, uds=str(sock_dir / "proxy.sock"))
+
+    assert "8798" not in paths.beacon_lock_path(config.instance_key).name
+    assert "8798" not in default_embedding_socket(config)
+    assert len(default_embedding_socket(config).encode()) < max_uds_path_length()
+
+
+@requires_uds
+@requires_core
+def test_relative_and_absolute_spellings_share_one_instance_key(
+    sock_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from headroom.proxy.models import ProxyConfig
+
+    monkeypatch.chdir(sock_dir)
+
+    relative = ProxyConfig(uds="proxy.sock").instance_key
+    absolute = ProxyConfig(uds=str(Path.cwd() / "proxy.sock")).instance_key
+
+    assert relative == absolute
