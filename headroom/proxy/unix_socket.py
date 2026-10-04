@@ -23,6 +23,7 @@ import os
 import signal
 import socket
 import stat
+import sys
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -35,6 +36,21 @@ SOCKET_MODE = stat.S_IRUSR | stat.S_IWUSR
 
 class UnixSocketInUseError(RuntimeError):
     """The socket path is held by a live listener or by something that is not a socket."""
+
+
+class UnixSocketUnusableError(RuntimeError):
+    """A unix socket cannot be served here: the platform has none, or the requested path cannot hold one."""
+
+
+def require_unix_sockets() -> None:
+    """Raise :class:`UnixSocketUnusableError` on a platform without ``socket.AF_UNIX``.
+
+    Windows builds of Python define no ``AF_UNIX``, so ``--uds`` would otherwise die with an ``AttributeError`` the first time the socket module is asked for it. Entry points call this before doing any other work.
+    """
+    if not hasattr(socket, "AF_UNIX"):
+        raise UnixSocketUnusableError(
+            f"--uds needs unix domain sockets, which {sys.platform} does not provide"
+        )
 
 
 @dataclass
