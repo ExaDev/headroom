@@ -326,6 +326,52 @@ class TestInstanceKeyedState:
 
         assert {r.request_id for r in report.perf_records} == {"hr_uds"}
 
+    def test_runtime_log_is_keyed_by_instance(self, socket_dir: Path, monkeypatch):
+        """A socket proxy must not write the runtime log of a TCP proxy on its unused port."""
+        from headroom.proxy import server
+
+        keys: list[int | str] = []
+        monkeypatch.setattr(
+            server, "_setup_file_logging", lambda key, process_id=None: keys.append(key)
+        )
+        config = ProxyConfig(port=8798, uds=str(socket_dir / "proxy.sock"))
+
+        server.create_app(config)
+
+        assert keys == [config.instance_key]
+
+    def test_orphan_watchdog_reads_markers_for_its_own_instance(
+        self, socket_dir: Path, tmp_path: Path, monkeypatch
+    ):
+        """A socket proxy must not stay alive on the wrap markers of a TCP proxy on its unused port."""
+        import asyncio
+        from types import SimpleNamespace
+
+        from headroom.proxy import orphan_watchdog
+
+        config = ProxyConfig(port=8798, uds=str(socket_dir / "proxy.sock"))
+        proxy = SimpleNamespace(
+            config=config,
+            ws_sessions=SimpleNamespace(active_count=lambda: 0),
+            active_request_count=0,
+            activity_generation=0,
+        )
+        keys: list[int | str] = []
+
+        def clients_dir(key: int | str) -> Path:
+            keys.append(key)
+            return tmp_path
+
+        monkeypatch.setattr(orphan_watchdog, "proxy_clients_dir", clients_dir)
+
+        asyncio.run(
+            orphan_watchdog.orphan_watchdog_loop(
+                proxy, grace_seconds=0.0, interval_seconds=0.0, stop=lambda: None
+            )
+        )
+
+        assert keys == [config.instance_key]
+
 
 class TestCliUdsFlag:
     def test_banner_and_config_use_the_resolved_path(self, socket_dir: Path, monkeypatch):
