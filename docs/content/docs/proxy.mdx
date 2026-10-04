@@ -226,16 +226,23 @@ curl --unix-socket ~/.headroom/run/proxy.sock http://localhost/health
 
 ### Permissions and lifecycle
 
-A Unix socket carries no credentials of its own, so **the mode of the directory
-holding it is the access-control boundary**.
+A Unix socket carries no credentials of its own, so access control is filesystem permissions, in two layers. **The socket is created `0600`**, before it starts listening, so only the user running the proxy can connect, whatever the parent directory's mode. **The parent directory decides who can replace the socket.**
 
-If the parent directory does not exist, Headroom creates it `0700`. If it already
-exists, Headroom does not touch its permissions — something else owns that
-directory's policy, and silently tightening it could lock out whatever put it
-there. Instead it refuses to start when an existing parent is writable by other
-users and not sticky, since anyone on the host could then replace the socket.
-(A sticky directory such as `/tmp` is accepted: others may create their own
-entries there but cannot unlink or rename yours.)
+If the parent directory does not exist, Headroom creates it `0700`. If it already exists, Headroom does not touch its permissions (something else owns that directory's policy, and silently tightening it could lock out whatever put it there). Instead it refuses to start when an existing parent is owned by another user (a directory's owner can remove any entry in it), or is writable by other users and not sticky, since anyone on the host could then replace the socket. A root-owned directory is accepted, and so is a sticky one such as `/tmp`: others may create their own entries there but cannot unlink or rename yours.
+
+On shutdown, including `SIGTERM`, Headroom removes the socket file, but only if the path still names the socket this process created, so a proxy that is stopping never removes a successor's socket. The process still exits by the signal (status 143 for `SIGTERM`).
+
+#### Who a socket caller is trusted as
+
+Over a socket the proxy sees no peer address, and the `0600` mode limits peers to the proxy's own user. Routes restricted to loopback callers (`/debug/*`, `/v1/retrieve`, `POST /v1/compress`) therefore admit socket callers, and `HEADROOM_PROXY_TOKEN` is not required of them, exactly as for a loopback caller.
+
+The `x-headroom-user-id` header is **not** honoured over a socket: a socket caller always uses the proxy's default memory partition (the token-derived identity when `HEADROOM_PROXY_TOKEN` is set, otherwise the OS user running the proxy). Partition selection trusts a caller only when it can prove it is loopback, and missing peer metadata deliberately does not count, so an unusual transport can never widen that trust. Since every socket caller already is the proxy's own user, the default partition is that user's partition.
+
+#### Options that need a TCP listener
+
+`--uds` (or `HEADROOM_UDS`) cannot be combined with `--host`/`--port` or `HEADROOM_HOST`/`HEADROOM_PORT`; the proxy exits with a usage error rather than silently picking one. `HEADROOM_CC_SWITCH_RECONCILE` is refused for the same reason, since it points Claude Code at `http://127.0.0.1:<port>`. `headroom wrap` always starts its own proxy on a TCP port and does not pass `HEADROOM_UDS` to it.
+
+Per-instance state (the beacon lock and the default embedding sidecar socket) is keyed by the socket path rather than by the port, so a socket proxy never shares it with a TCP proxy or with another socket proxy.
 
 On startup Headroom removes a stale socket left behind by a crashed process, but
 it refuses to start when:
@@ -243,9 +250,7 @@ it refuses to start when:
 - something is still listening on the path (two proxies would silently split traffic),
 - the path exists and is not a socket (far more likely a typo'd argument pointing
   at real data than a leftover), or
-- the path exceeds the platform's `sun_path` limit — 108 bytes on Linux, 104 on
-  macOS and the BSDs. Keep it short; a long path fails inside `bind()` with an
-  error that names nothing.
+- the path exceeds the platform's `sun_path` limit: 108 bytes on Linux, 104 on macOS and the BSDs. Keep it short, for example a private directory under `/tmp`; on macOS `$TMPDIR` is a deep per-user path that leaves little room.
 
 <Callout type="warn">
   `--uds` is POSIX-only. On Windows the command exits immediately with an error

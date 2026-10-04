@@ -647,3 +647,27 @@ def test_reconciler_refusal_applies_only_to_socket_listeners(
 
     monkeypatch.delenv("HEADROOM_CC_SWITCH_RECONCILE")
     refuse_unix_socket_listener("/tmp/hr.sock")
+
+
+# --------------------------------------------------------------------------
+# Trust model: a socket peer is local for admin routes but cannot pick a partition.
+# --------------------------------------------------------------------------
+
+
+def test_socket_caller_cannot_select_a_memory_partition(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pins the documented trust model: no peer address means no header trust."""
+    from types import SimpleNamespace
+
+    from headroom.proxy.identity import USER_ID_HEADER, resolve_memory_identity
+
+    monkeypatch.delenv("HEADROOM_PROXY_TOKEN", raising=False)
+    socket_request = SimpleNamespace(client=None, headers={USER_ID_HEADER: "someone-else"})
+
+    assert resolve_memory_identity(socket_request, default="proxy-owner") == "proxy-owner"
+
+
+def test_socket_caller_is_local_for_loopback_only_routes() -> None:
+    """The /debug guard and the token exemption admit a peer with no address; the 0600 socket mode is what justifies that."""
+    from headroom.proxy.loopback_guard import is_loopback_host
+
+    assert is_loopback_host(None)
