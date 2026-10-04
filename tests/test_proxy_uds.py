@@ -671,3 +671,69 @@ def test_socket_caller_is_local_for_loopback_only_routes() -> None:
     from headroom.proxy.loopback_guard import is_loopback_host
 
     assert is_loopback_host(None)
+
+
+# --------------------------------------------------------------------------
+# Startup output: one-line path errors before the banner, absolute paths in it.
+# --------------------------------------------------------------------------
+
+
+@requires_uds
+@requires_core
+def test_cli_reports_an_unusable_path_in_one_line_before_the_banner() -> None:
+    target = f"/tmp/{'d' * 120}/headroom.sock"
+
+    result = CliRunner().invoke(proxy_cmd, ["--uds", target])
+
+    assert result.exit_code == 1, result.output
+    assert "sun_path limit" in result.output
+    assert "HEADROOM PROXY" not in result.output
+    assert "Traceback" not in result.output
+
+
+@requires_uds
+@requires_core
+@pytest.mark.parametrize("backend", ["anthropic", "litellm-vertex"])
+def test_cli_banner_prints_the_absolute_socket_path_and_no_tcp_url(
+    sock_dir: Path, monkeypatch: pytest.MonkeyPatch, backend: str
+) -> None:
+    monkeypatch.chdir(sock_dir)
+    with patch("headroom.proxy.server.run_server"):
+        result = CliRunner().invoke(
+            proxy_cmd, ["--uds", "proxy.sock", "--backend", backend, "--no-telemetry"]
+        )
+
+    assert result.exit_code == 0, result.output
+    assert f"unix:{Path.cwd() / 'proxy.sock'}" in result.output
+    assert "ANTHROPIC_BASE_URL=http" not in result.output
+
+
+@requires_uds
+@requires_core
+def test_module_entry_point_accepts_uds_and_refuses_it_with_a_port(sock_dir: Path) -> None:
+    import subprocess
+    import sys
+
+    help_text = subprocess.run(  # noqa: S603
+        [sys.executable, "-m", "headroom.proxy.server", "--help"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "--uds" in help_text
+
+    refused = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "-m",
+            "headroom.proxy.server",
+            "--uds",
+            str(sock_dir / "proxy.sock"),
+            "--port",
+            "8798",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert refused.returncode == 2
+    assert "--uds cannot be combined with --port" in refused.stderr

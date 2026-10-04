@@ -1160,13 +1160,19 @@ def proxy(
     # Fail before any dependency loading or config work: an unusable --uds is a
     # typo or an unsupported platform, and both are cheaper to report up front.
     if uds:
-        from headroom.proxy.uds import UdsError, require_uds_support
+        from headroom.proxy.uds import UdsError, prepare_uds_path, require_uds_support
 
         try:
             require_uds_support()
         except UdsError as exc:
             raise click.ClickException(str(exc)) from exc
         _refuse_tcp_listen_options_with_uds(ctx)
+        # Validate the path now, so an unusable one is a one-line error before the
+        # banner, and carry the absolute path from here on for the banner and state.
+        try:
+            uds = str(prepare_uds_path(uds))
+        except UdsError as exc:
+            raise click.ClickException(str(exc)) from exc
 
         from headroom.proxy.cc_switch_reconciler import refuse_unix_socket_listener
 
@@ -1560,12 +1566,16 @@ def proxy(
         env_vars_str = (
             ", ".join(provider_config.env_vars) if provider_config.env_vars else "See docs"
         )
+        if config.uds:
+            base_url_step = f"Point a client that speaks HTTP over a Unix socket at {config.uds}"
+        else:
+            base_url_step = f"Set base URL: ANTHROPIC_BASE_URL=http://{config.host}:{config.port}"
         backend_section = f"""
 IMPORTANT for {provider_config.display_name} users:
   1. Set credentials: {env_vars_str}
   2. Set a dummy Anthropic key: ANTHROPIC_API_KEY="sk-ant-dummy"
      (Headroom ignores this - it uses your {provider_config.display_name} credentials)
-  3. Set base URL: ANTHROPIC_BASE_URL=http://{config.host}:{config.port}"""
+  3. {base_url_step}"""
         if provider_config.model_format_hint:
             backend_section += f"\n  4. Use model names: {provider_config.model_format_hint}"
         backend_section += "\n"
@@ -1783,6 +1793,8 @@ Press Ctrl+C to stop.
             )
             os.environ.pop("HEADROOM_EMBEDDING_SERVER_SOCKET", None)
 
+    from headroom.proxy.uds import UdsError
+
     try:
         run_kwargs: dict[str, Any] = {}
         if workers != 1:
@@ -1794,6 +1806,10 @@ Press Ctrl+C to stop.
         # the legacy banner via run_server's default.
         run_kwargs["print_banner"] = False
         run_server(config, **run_kwargs)
+    except UdsError as exc:
+        # The path was validated before the banner; this is the window between
+        # that check and the bind (e.g. another proxy started on the same path).
+        raise click.ClickException(str(exc)) from None
     except KeyboardInterrupt:
         click.echo("\nShutting down...")
         raise SystemExit(130) from None

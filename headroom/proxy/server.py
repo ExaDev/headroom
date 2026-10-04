@@ -5387,9 +5387,15 @@ def run_server(
     # Resolve upstream API targets for display in the banner (#583).
     api_targets = resolve_api_targets(config.provider_api_overrides)
 
+    # Validate the socket path before the banner, so a bad path is a one-line
+    # error rather than a traceback under a banner announcing a listener.
+    uds_path: Path | None = None
     if config.uds:
+        from headroom.proxy.uds import prepare_uds_path
+
+        uds_path = prepare_uds_path(config.uds)
         # No per-agent recipe on a socket bind; see uds.socket_usage_lines().
-        listen_display = f"unix:{config.uds}"
+        listen_display = f"unix:{uds_path}"
         usage_label = "Client:     "
         usage_display = "must support HTTP over a Unix socket natively"
     else:
@@ -5504,13 +5510,13 @@ def run_server(
     # and no CLI flag to change it. Overridable now; the default is unchanged.
     uvicorn_log_level = _resolve_uvicorn_log_level()
 
-    if config.uds:
-        from headroom.proxy.uds import prepare_uds_path, serving_uds
+    if uds_path is not None:
+        from headroom.proxy.uds import serving_uds
 
         # Headroom binds the socket and hands uvicorn the descriptor, so the
         # socket is 0600 before uvicorn listens and is removed on SIGTERM too;
         # see bind_uds_listener() and serving_uds().
-        with serving_uds(prepare_uds_path(config.uds)) as listener:
+        with serving_uds(uds_path) as listener:
             _run_uvicorn(
                 app_target,
                 {"fd": listener.sock.fileno()},
@@ -5711,8 +5717,19 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Headroom Proxy Server")
 
     # Server
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8787)
+    # No argparse defaults for the TCP address, so an explicit value can be told
+    # apart from the default and refused alongside --uds; ProxyConfig owns them.
+    parser.add_argument("--host", default=None, help="Host to bind to (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=None, help="Port to bind to (default: 8787)")
+    parser.add_argument(
+        "--uds",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Serve on a Unix domain socket at PATH instead of a TCP host and port. "
+            "POSIX only. Cannot be combined with --host/--port or HEADROOM_HOST/HEADROOM_PORT."
+        ),
+    )
     parser.add_argument(
         "--openai-api-url", help=f"Custom OpenAI API URL (default: {DEFAULT_OPENAI_API_URL})"
     )
@@ -6028,10 +6045,23 @@ if __name__ == "__main__":
     from headroom.rollout import resolve_rollout
 
     rollout = resolve_rollout()
+    tcp_address_sources = [
+        source
+        for source, given in (
+            ("--host", args.host is not None),
+            ("--port", args.port is not None),
+            ("HEADROOM_HOST", "HEADROOM_HOST" in os.environ),
+            ("HEADROOM_PORT", "HEADROOM_PORT" in os.environ),
+        )
+        if given
+    ]
+    if args.uds is not None and tcp_address_sources:
+        parser.error(f"--uds cannot be combined with {', '.join(tcp_address_sources)}")
     config = ProxyConfig(
         rollout=rollout,
-        host=_get_env_str("HEADROOM_HOST", args.host),
-        port=_get_env_int("HEADROOM_PORT", args.port),
+        uds=args.uds,
+        host=_get_env_str("HEADROOM_HOST", ProxyConfig.host if args.host is None else args.host),
+        port=_get_env_int("HEADROOM_PORT", ProxyConfig.port if args.port is None else args.port),
         openai_api_url=_get_env_str("OPENAI_TARGET_API_URL", args.openai_api_url),
         anthropic_api_url=_get_env_str("ANTHROPIC_TARGET_API_URL", args.anthropic_api_url),
         anthropic_buffered_request_timeout_seconds=_get_env_int(
@@ -6127,4 +6157,9 @@ if __name__ == "__main__":
     workers = _get_env_int("HEADROOM_WORKERS", args.workers)
     limit_concurrency = _get_env_int("HEADROOM_LIMIT_CONCURRENCY", args.limit_concurrency)
 
-    run_server(config, workers=workers, limit_concurrency=limit_concurrency)
+    from headroom.proxy.uds import UdsError
+
+    try:
+        run_server(config, workers=workers, limit_concurrency=limit_concurrency)
+    except UdsError as exc:
+        parser.exit(1, f"error: {exc}\n")
