@@ -69,6 +69,8 @@ def _scrub_developer_headroom_env(monkeypatch, tmp_path):
         if key.startswith("HEADROOM_"):
             monkeypatch.delenv(key, raising=False)
     monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
+    # Scrubbing also drops the HEADROOM_HARD_WATCHDOG_SECS=0 that CI sets, and any app lifespan a test starts would then arm the production watchdog, which hard-exits the whole pytest process and erases its diagnostics. Tests of the watchdog set their own value.
+    monkeypatch.setenv("HEADROOM_HARD_WATCHDOG_SECS", "0")
     # Clearing HEADROOM_* alone leaves file-backed settings active. Give every
     # test its own store so proxy/CLI startup cannot load developer settings and
     # saves cannot rewrite them. Tests of path precedence can override this.
