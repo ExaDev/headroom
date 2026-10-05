@@ -1086,3 +1086,24 @@ def _alive(pid: int) -> bool:
     except ProcessLookupError:
         return False
     return True
+
+
+@requires_uds
+@requires_core
+def test_module_entry_point_reads_headroom_uds(sock_dir: Path) -> None:
+    """HEADROOM_UDS reaches the module entry point too, not only `headroom proxy`."""
+    import subprocess
+    import sys
+
+    env = {**os.environ, "HEADROOM_UDS": str(sock_dir / "proxy.sock")}
+    env.pop("HEADROOM_HOST", None)
+    env.pop("HEADROOM_PORT", None)
+    refused = subprocess.run(  # noqa: S603
+        [sys.executable, "-m", "headroom.proxy.server", "--port", "8798"],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=_SIGTERM_STARTUP_DEADLINE_SECS,
+    )
+    assert refused.returncode == 2
+    assert "HEADROOM_UDS cannot be combined with --port" in refused.stderr

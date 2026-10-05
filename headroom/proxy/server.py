@@ -6910,6 +6910,9 @@ if __name__ == "__main__":
     from headroom.rollout import resolve_rollout
 
     rollout = resolve_rollout()
+    # `headroom proxy` reads HEADROOM_UDS through Click; read it here too, so the
+    # setting does not silently fall back to TCP when the module is run directly.
+    uds = args.uds if args.uds is not None else (os.environ.get("HEADROOM_UDS") or None)
     tcp_address_sources = [
         source
         for source, given in (
@@ -6920,11 +6923,12 @@ if __name__ == "__main__":
         )
         if given
     ]
-    if args.uds is not None and tcp_address_sources:
-        parser.error(f"--uds cannot be combined with {', '.join(tcp_address_sources)}")
+    if uds is not None and tcp_address_sources:
+        uds_source = "--uds" if args.uds is not None else "HEADROOM_UDS"
+        parser.error(f"{uds_source} cannot be combined with {', '.join(tcp_address_sources)}")
     config = ProxyConfig(
         rollout=rollout,
-        uds=args.uds,
+        uds=uds,
         host=_get_env_str("HEADROOM_HOST", ProxyConfig.host if args.host is None else args.host),
         port=_get_env_int("HEADROOM_PORT", ProxyConfig.port if args.port is None else args.port),
         openai_api_url=_get_env_str("OPENAI_TARGET_API_URL", args.openai_api_url),

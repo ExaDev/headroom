@@ -283,14 +283,18 @@ def prepare_uds_path(path: str | os.PathLike[str], *, platform: str | None = Non
 class UdsListener:
     """A bound, not yet listening, stream socket at *path* with mode :data:`SOCKET_MODE`.
 
-    *device* and *inode* identify the socket file this listener created, so
-    :meth:`close` can tell it apart from a successor's socket at the same path.
+    *device*, *inode* and *changed_ns* identify the socket file this listener
+    created, so :meth:`close` can tell it apart from a successor's socket at the
+    same path. The inode alone is not enough: Linux filesystems hand a just-freed
+    inode number straight to the next file created, so a successor's socket often
+    carries this one's (device, inode). Its inode change time still differs.
     """
 
     path: Path
     sock: socket.socket
     device: int
     inode: int
+    changed_ns: int
 
     def close(self) -> None:
         """Close the socket and remove its file if the path still names this socket.
@@ -303,7 +307,11 @@ class UdsListener:
             current = self.path.lstat()
         except FileNotFoundError:
             return
-        if (current.st_dev, current.st_ino) == (self.device, self.inode):
+        if (current.st_dev, current.st_ino, current.st_ctime_ns) == (
+            self.device,
+            self.inode,
+            self.changed_ns,
+        ):
             self.path.unlink()
 
 
@@ -325,7 +333,13 @@ def bind_uds_listener(path: Path) -> UdsListener:
     except BaseException:
         sock.close()
         raise
-    return UdsListener(path=path, sock=sock, device=bound.st_dev, inode=bound.st_ino)
+    return UdsListener(
+        path=path,
+        sock=sock,
+        device=bound.st_dev,
+        inode=bound.st_ino,
+        changed_ns=bound.st_ctime_ns,
+    )
 
 
 class _Terminated(BaseException):
