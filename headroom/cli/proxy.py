@@ -1384,8 +1384,8 @@ def proxy(
                 allowed_base_urls_file
             )
         else:
-            # Blank means no file, as a blank HEADROOM_ALLOWED_BASE_URLS means no list; an explicit `--allowed-base-urls-file ""` also overrides a path inherited from the environment or stored settings.
-            os.environ.pop(ALLOWED_BASE_URLS_FILE_ENV, None)
+            # Blank means no file, as a blank HEADROOM_ALLOWED_BASE_URLS means no list. Set to "" rather than removed: create_app re-applies stored settings with setdefault (in this process and in every worker), which would put a stored path back into a missing variable but leaves a present one alone, so an explicit `--allowed-base-urls-file ""` overrides a stored or inherited path.
+            os.environ[ALLOWED_BASE_URLS_FILE_ENV] = ""
 
     config = ProxyConfig(
         host=host,
