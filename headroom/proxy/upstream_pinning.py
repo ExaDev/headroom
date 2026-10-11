@@ -94,9 +94,10 @@ def proxied_upstream_listed(url: httpx.URL) -> bool:
     """Whether the operator listed ``url``'s destination in HEADROOM_PROXIED_BASE_URLS.
 
     Read per request, like the guard's own allowlist, so a test or an operator
-    changing the environment does not need a new client.
+    changing the environment does not need a new client. This list has no file
+    form: ``HEADROOM_ALLOWED_BASE_URLS_FILE`` extends only the guard's allowlist.
     """
-    allow = allowlisted_destinations(PROXIED_BASE_URLS_ENV)
+    allow = allowlisted_destinations(PROXIED_BASE_URLS_ENV, file_env=None)
     return allow is not None and destination_listed(allow, url.scheme, url.host, url.port)
 
 
