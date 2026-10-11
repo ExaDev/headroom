@@ -74,6 +74,7 @@ import from any handler without risking an import cycle.
 from __future__ import annotations
 
 import asyncio
+import errno
 import ipaddress
 import logging
 import os
@@ -281,12 +282,34 @@ _O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 _O_NOCTTY = getattr(os, "O_NOCTTY", 0)
 
 
-class _UnusableAllowlistFile(Exception):
-    """The file at the path cannot be used as an allowlist, and which version of it that was."""
+# Errors that describe the file at the path, or the path itself, rather than the state of this process or the machine at the moment of the read. Only these are remembered against a file version: retrying the same version would meet them again. Everything else (EMFILE, ENFILE, ENOMEM, EIO, EINTR, ...) can clear without the file changing, so it is retried on the next check.
+_FILE_ERRNOS = frozenset(
+    {
+        errno.EACCES,
+        errno.EPERM,
+        errno.ELOOP,
+        errno.ENOENT,
+        errno.ENOTDIR,
+        errno.EISDIR,
+        errno.ENAMETOOLONG,
+    }
+)
 
-    def __init__(self, reason: str, identity: _FileIdentity) -> None:
+
+class _UnusableAllowlistFile(Exception):
+    """The file at the path cannot be used as an allowlist, and which version of it that was.
+
+    ``lasting`` is false for a failure that may clear while the file stays as it is, which must not be cached against its identity.
+    """
+
+    def __init__(self, reason: str, identity: _FileIdentity, *, lasting: bool = True) -> None:
         super().__init__(reason)
         self.identity = identity
+        self.lasting = lasting
+
+    @classmethod
+    def from_os_error(cls, exc: OSError, identity: _FileIdentity) -> _UnusableAllowlistFile:
+        return cls(str(exc), identity, lasting=exc.errno in _FILE_ERRNOS)
 
 
 def _read_allowlist_file(path: str, st: os.stat_result) -> tuple[_FileIdentity, str]:
@@ -300,7 +323,7 @@ def _read_allowlist_file(path: str, st: os.stat_result) -> tuple[_FileIdentity, 
     try:
         fd = os.open(path, os.O_RDONLY | _O_NONBLOCK | _O_NOCTTY)
     except OSError as exc:
-        raise _UnusableAllowlistFile(str(exc), identity) from exc
+        raise _UnusableAllowlistFile.from_os_error(exc, identity) from exc
     with os.fdopen(fd, "rb") as handle:
         st = os.fstat(handle.fileno())
         # The identity recorded is the descriptor's, not the caller's `stat`'s. A rename between the two means the bytes read are the newer file's; filed under the older identity, the next check would see a mismatch and read the file again for nothing.
@@ -316,7 +339,7 @@ def _read_allowlist_file(path: str, st: os.stat_result) -> tuple[_FileIdentity, 
             # One byte past the cap, so a file that grew after the `fstat` is still caught.
             data = handle.read(_MAX_ALLOWLIST_FILE_BYTES + 1)
         except OSError as exc:
-            raise _UnusableAllowlistFile(str(exc), identity) from exc
+            raise _UnusableAllowlistFile.from_os_error(exc, identity) from exc
     if len(data) > _MAX_ALLOWLIST_FILE_BYTES:
         raise too_large
     try:
@@ -329,7 +352,7 @@ def _read_allowlist_file(path: str, st: os.stat_result) -> tuple[_FileIdentity, 
 class _AllowlistFiles:
     """What each allowlist file held, re-read only when the file's identity changes.
 
-    A version that could not be used is cached too, as ``None``, so a file that is oversized, not UTF-8 or unreadable costs one ``stat`` per check like a good one, not an open and a read on every request.
+    A version that could not be used is cached too, as ``None``, so a file that is oversized, not UTF-8 or unreadable costs one ``stat`` per check like a good one, not an open and a read on every request. A failure that is not the file's own (see ``_FILE_ERRNOS``) is not cached: that check fails closed and the next one tries again.
 
     Thread-safe: the event loop and the resolver pool both reach the guard. Checks against an unchanged file take only the bookkeeping lock. Checks that see a change queue on one reload lock and re-check the cache once they hold it, so a change is read and logged once however many requests arrive together; the wait is bounded by one read of at most ``_MAX_ALLOWLIST_FILE_BYTES``.
     """
@@ -371,8 +394,9 @@ class _AllowlistFiles:
             try:
                 identity, raw = _read_allowlist_file(path, st)
             except _UnusableAllowlistFile as exc:
-                with self._lock:
-                    self._loaded[path] = (exc.identity, None)
+                if exc.lasting:
+                    with self._lock:
+                        self._loaded[path] = (exc.identity, None)
                 self._report(path, str(exc), file_env, env)
                 return None
             entries, skipped = _parse_destinations(raw, comments=True)

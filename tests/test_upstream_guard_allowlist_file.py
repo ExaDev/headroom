@@ -5,6 +5,7 @@ A supervisor that lists its own loopback endpoint cannot restart a proxy that se
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import socket
@@ -490,6 +491,31 @@ def test_an_oversized_file_is_refused_from_its_size_before_any_read(
 
     assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
     assert read_sizes == []
+
+
+@pytest.mark.parametrize("error", [errno.EMFILE, errno.ENFILE, errno.EIO, errno.ENOMEM])
+def test_a_transient_open_failure_is_retried_on_the_next_check(
+    allow_file: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, error: int
+) -> None:
+    """Running out of descriptors says nothing about the file, so it must not stick to it."""
+    caplog.set_level(logging.WARNING, logger="headroom.proxy.upstream_guard")
+    _replace(allow_file, "http://127.0.0.1:4100")
+    real_open = os.open
+    failures = [error, error]
+
+    def failing_open(path: str, *args: object, **kwargs: object) -> int:
+        if os.fspath(path) == str(allow_file) and failures:
+            raise OSError(failures.pop(), os.strerror(error), os.fspath(path))
+        return real_open(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", failing_open)
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert os.strerror(error) in warnings[0]
 
 
 def test_concurrent_checks_after_a_change_read_and_log_it_once(
