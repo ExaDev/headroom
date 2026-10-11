@@ -320,6 +320,41 @@ def test_a_bare_host_with_a_port_is_invalid_in_the_variable(
     assert is_safe_upstream_url("https://gateway.internal:8443/v1") is True
 
 
+def test_a_byte_order_mark_is_ignored(allow_file: Path) -> None:
+    allow_file.write_bytes("\ufeffhttp://127.0.0.1:4100\n".encode())
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+
+
+def test_carriage_returns_and_tabs_separate_entries(allow_file: Path) -> None:
+    allow_file.write_bytes(b"http://127.0.0.1:4100\rhttp://127.0.0.1:4200\thttp://127.0.0.1:4300")
+
+    for port in (4100, 4200, 4300):
+        assert is_safe_upstream_url(f"http://127.0.0.1:{port}/v1") is True
+
+
+def test_whole_line_comments_are_ignored_in_the_file(
+    allow_file: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="headroom.proxy.upstream_guard")
+    _replace(
+        allow_file,
+        "# written by the supervisor\n  # gateway.internal, http://127.0.0.1:4200\nhttp://127.0.0.1:4100\n",
+    )
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+    assert is_safe_upstream_url("https://gateway.internal/v1") is False
+    assert is_safe_upstream_url("http://127.0.0.1:4200/v1") is False
+    assert any("0 invalid entries skipped" in r.getMessage() for r in caplog.records)
+
+
+def test_a_hash_entry_in_the_variable_is_not_a_comment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(LIST_ENV, "#gateway.internal\nhttp://127.0.0.1:4100")
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+    assert is_safe_upstream_url("https://gateway.internal/v1") is False
+
+
 def test_a_blank_file_variable_is_treated_as_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(FILE_ENV, "  ")
 
