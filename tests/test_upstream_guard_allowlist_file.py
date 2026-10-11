@@ -518,6 +518,29 @@ def test_a_transient_open_failure_is_retried_on_the_next_check(
     assert os.strerror(error) in warnings[0]
 
 
+def test_the_failure_warning_says_what_each_route_does(
+    allow_file: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Not every route answers 400: the OpenAI handlers fall back to the configured upstream."""
+    caplog.set_level(logging.WARNING, logger="headroom.proxy.upstream_guard")
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+
+    (warning,) = [r.getMessage() for r in caplog.records]
+    assert "rejected with 400" not in warning
+    assert "/v1/messages, /v1/alpha/search and the catch-all passthrough answer 400" in warning
+    assert "send the request to the configured upstream" in warning
+
+
+def test_the_openai_chat_handler_ignores_a_refused_override(allow_file: Path) -> None:
+    """The behaviour the warning describes, read from the handler rather than assumed."""
+    from headroom.proxy.handlers.openai import _resolve_openai_upstream_base
+
+    _replace(allow_file, "")
+
+    assert _resolve_openai_upstream_base({"x-headroom-base-url": "http://127.0.0.1:4100"}) is None
+
+
 def test_concurrent_checks_after_a_change_read_and_log_it_once(
     allow_file: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

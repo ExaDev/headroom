@@ -424,8 +424,10 @@ class _AllowlistFiles:
             self._reported[path] = reason
         logger.warning(
             "%s: cannot read %s (%s). Until it can be read, only the entries in "
-            "%s are allowlisted (none when it is unset) and every other "
-            "x-headroom-base-url is rejected with 400.",
+            "%s are allowlisted (none when it is unset). Any other "
+            "x-headroom-base-url is not used: /v1/messages, /v1/alpha/search and "
+            "the catch-all passthrough answer 400, and the OpenAI chat-completions "
+            "and responses handlers send the request to the configured upstream.",
             file_env,
             path,
             reason,
