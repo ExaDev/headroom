@@ -435,10 +435,12 @@ class _AllowlistFiles:
 
 _ALLOWLIST_FILES = _AllowlistFiles()
 
-_SEPARATORS = re.compile(r"[,\n\r\t]")
+# The line boundaries `str.splitlines` recognises: newline, carriage return, vertical tab, form feed, the file, group and record separators, next line (NEL), and the Unicode line and paragraph separators. Each ends a line, and so a comment, and separates entries.
+_LINE_BREAKS = "\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"
+_SEPARATORS = re.compile(f"[,\t{_LINE_BREAKS}]")
 
-# A comment in the file: a "#" at the very start, or after a space, tab, newline or carriage return, through to the end of its line (the next newline or carriage return, the line-ending members of `_SEPARATORS`). A "#" anywhere else is part of an entry, which then fails to parse as one.
-_COMMENT = re.compile(r"(?:^|(?<=[ \t\r\n]))#[^\r\n]*")
+# A comment in the file: a "#" at the very start, or after any whitespace character (`\s` in a str pattern is `str.isspace`, the same test that makes an entry containing whitespace invalid), through to the next line break. So text an operator spaced off with any kind of blank before a "#" is always a comment, never part of an entry that would fail or, after a comma, a hidden one that would count. A "#" anywhere else is part of an entry: after an origin in a URL it begins the fragment, which an origin ignores; anywhere else it makes the entry invalid.
+_COMMENT = re.compile(f"(?:^|(?<=\\s))#[^{_LINE_BREAKS}]*")
 
 
 def _parse_bare_host(item: str) -> str | None:
@@ -477,9 +479,9 @@ def _parse_entry(item: str) -> str | tuple[str, str, int] | None:
 
 
 def _parse_destinations(raw: str, *, comments: bool = False) -> tuple[Destinations, int]:
-    """Parse hosts and URLs separated by commas, newlines, carriage returns or tabs.
+    """Parse hosts and URLs separated by commas, tabs or line breaks (``_LINE_BREAKS``).
 
-    With ``comments``, a ``#`` at the start of the text or after a space, tab, newline or carriage return begins a comment that runs to the end of its line. Only the file takes comments: a variable has no lines to comment out, and there a ``#`` stays part of an entry, which is then invalid.
+    With ``comments``, a ``#`` at the start of the text or after any whitespace character begins a comment that runs to the next line break. Only the file takes comments: a variable has no lines to comment out, and there a ``#`` stays part of an entry, which is then invalid.
 
     Returns the destinations and how many non-blank entries were skipped as invalid: neither a host nor a URL with a safe scheme, or not parseable at all. A list of nothing valid is an empty allowlist, not an absent one.
     """

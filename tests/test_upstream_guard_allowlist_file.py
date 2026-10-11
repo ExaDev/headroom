@@ -614,16 +614,45 @@ def test_whitespace_inside_a_file_entry_makes_it_invalid(
     assert any("1 invalid entry skipped" in r.getMessage() for r in caplog.records)
 
 
-def test_only_newline_and_carriage_return_end_a_comment(allow_file: Path) -> None:
-    """``str.splitlines`` would also end a comment at U+2028, U+2029 or NEL."""
-    _replace(
-        allow_file,
-        "# note\u2028http://127.0.0.1:4200\x85http://127.0.0.1:4300\nhttp://127.0.0.1:4100\n",
-    )
+@pytest.mark.parametrize(
+    "blank",
+    ["\u00a0", "\x0c", "\u2028", "\u2029", "\x85", "\u3000"],
+    ids=["nbsp", "form-feed", "line-separator", "paragraph-separator", "nel", "ideographic-space"],
+)
+def test_any_whitespace_before_a_hash_starts_a_comment(allow_file: Path, blank: str) -> None:
+    """Text spaced off before a ``#`` is a comment, never a hidden entry after its comma."""
+    _replace(allow_file, f"http://a.example{blank}# was, http://c.example\n")
+
+    assert is_safe_upstream_url("http://a.example/v1") is True
+    assert is_safe_upstream_url("http://c.example/v1") is False
+
+
+@pytest.mark.parametrize(
+    "brk", ["\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"]
+)
+def test_every_line_break_ends_a_comment_and_separates_entries(allow_file: Path, brk: str) -> None:
+    _replace(allow_file, f"# note{brk}http://127.0.0.1:4100{brk}http://127.0.0.1:4200\n")
 
     assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
-    assert is_safe_upstream_url("http://127.0.0.1:4200/v1") is False
-    assert is_safe_upstream_url("http://127.0.0.1:4300/v1") is False
+    assert is_safe_upstream_url("http://127.0.0.1:4200/v1") is True
+
+
+def test_the_line_breaks_are_exactly_those_splitlines_recognises() -> None:
+    boundaries = {chr(code) for code in range(0x110000) if len(f"a{chr(code)}b".splitlines()) == 2}
+    assert set(upstream_guard._LINE_BREAKS) == boundaries
+
+
+def test_the_comment_look_behind_uses_the_same_whitespace_as_entries() -> None:
+    """``\\s`` must be ``str.isspace``, or the comment and the invalid-entry rules disagree."""
+    import re
+
+    pattern = re.compile(r"\s")
+    disagree = [
+        hex(code)
+        for code in range(0x110000)
+        if bool(pattern.match(chr(code))) != chr(code).isspace()
+    ]
+    assert disagree == []
 
 
 @pytest.mark.parametrize(
