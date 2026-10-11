@@ -9,10 +9,39 @@ Policy:
   * Default: reject destinations that resolve to private, loopback, link-local,
     or otherwise non-public addresses. Public hosts (api.openai.com, api.x.ai,
     Azure, ...) are allowed so ordinary BYOK keeps working.
-  * When ``HEADROOM_ALLOWED_BASE_URLS`` is set (comma-separated hosts or URLs),
-    bare hosts permit every safe scheme/port for that host, while URLs permit
-    only their exact normalized origin. Because that is an explicit operator
-    choice, allowlisted destinations may point at internal/on-prem endpoints.
+  * When ``HEADROOM_ALLOWED_BASE_URLS`` is set (hosts or URLs separated by
+    commas and/or newlines), bare hosts permit every safe scheme/port for that
+    host, while URLs permit only their exact normalized origin. Because that is
+    an explicit operator choice, allowlisted destinations may point at
+    internal/on-prem endpoints.
+  * ``HEADROOM_ALLOWED_BASE_URLS_FILE`` names a file holding more entries in the
+    same format, merged with the variable's. The variable is fixed for the
+    life of the process; the file is re-read whenever it changes, so a
+    supervisor whose own listed endpoint moves (a loopback port chosen at
+    start-up, say) can rewrite the file instead of restarting a proxy that
+    sessions are still using. Replace it atomically (write a sibling, then
+    rename over it): a change is detected by the file's identity (inode,
+    modification time and size), and an unchanged file costs one ``stat`` per
+    check, never a read.
+
+Naming a file is itself the operator's choice of allowlist mode, so it never
+falls back to the public-host default, whatever state the file is in:
+
+  * readable, with entries: allowlist mode, admitting the file's entries plus
+    the variable's.
+  * readable but empty (or holding no valid entry): allowlist mode admitting
+    only the variable's entries, and nothing at all when the variable is unset.
+    This follows the existing meaning of the two shapes ``allowlisted_destinations``
+    returns: ``None`` is "no allowlist, apply the default policy", while an
+    empty list is "allowlist mode, nothing listed", which a variable holding
+    only separators already produces. A supervisor that truncates the file
+    before it knows its endpoints therefore gets a proxy that refuses every
+    caller-supplied upstream, not one that briefly admits every public host.
+  * missing or unreadable (permissions, a directory, not UTF-8): the same as
+    empty, logged at warning level once per distinct failure rather than on
+    every request, and logged again if it recurs after the file was read.
+  * the file variable set to blank: as if unset, mirroring how a blank
+    ``HEADROOM_ALLOWED_BASE_URLS`` is treated.
 
 Answering "is this safe?" is only half the job: the answer has to survive to the
 socket. Every accepted destination therefore has the addresses it was judged on
@@ -38,8 +67,11 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import logging
 import os
+import re
 import socket
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as _FutureTimeout
@@ -47,7 +79,10 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
+logger = logging.getLogger(__name__)
+
 ALLOWED_BASE_URLS_ENV = "HEADROOM_ALLOWED_BASE_URLS"
+ALLOWED_BASE_URLS_FILE_ENV = "HEADROOM_ALLOWED_BASE_URLS_FILE"
 
 # `socket.getaddrinfo` has no timeout parameter and runs on whatever thread
 # calls it -- which, for the proxy, is the event loop. A caller-supplied host
@@ -205,16 +240,109 @@ def clear_validated_addresses() -> None:
     _PIN_SCOPE.set(None)
 
 
-def allowlisted_destinations(
-    env: str = ALLOWED_BASE_URLS_ENV,
-) -> tuple[set[str], set[tuple[str, str, int]]] | None:
-    """Parse a comma-separated host/URL list from ``env``; ``None`` when unset."""
-    raw = os.environ.get(env)
-    if not raw or not raw.strip():
-        return None
+Destinations = tuple[frozenset[str], frozenset[tuple[str, str, int]]]
+"""Bare hosts (any safe scheme and port) and exact ``(scheme, host, port)`` origins."""
+
+_NO_DESTINATIONS: Destinations = (frozenset(), frozenset())
+
+
+@dataclass(frozen=True)
+class _FileIdentity:
+    """What distinguishes one version of a file from another without reading it.
+
+    A rename-replaced file has a new inode; an in-place rewrite changes the modification time and usually the size. ``st_mtime_ns`` rather than ``st_mtime`` so two writes within one coarse timestamp tick still differ on filesystems that record nanoseconds.
+    """
+
+    inode: int
+    mtime_ns: int
+    size: int
+
+    @classmethod
+    def of(cls, st: os.stat_result) -> _FileIdentity:
+        return cls(st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+class _AllowlistFiles:
+    """Parsed allowlist files, re-read only when a file's identity changes.
+
+    Thread-safe: the event loop and the resolver pool both reach the guard. The lock covers only the bookkeeping, never the ``stat`` or the read, so a slow filesystem cannot serialise every check behind one reader. Two threads that both see a change may both read the file; each records what it read against the identity of the descriptor it read from, so whichever lands last is still a consistent pair.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._loaded: dict[str, tuple[_FileIdentity, Destinations]] = {}
+        self._reported: dict[str, tuple[str, int | None]] = {}
+
+    def load(self, path: str, file_env: str, env: str) -> Destinations | None:
+        """Return ``path``'s entries, or ``None`` when it cannot be read.
+
+        ``file_env`` names the variable that pointed here and ``env`` the list
+        its entries are merged with; both are for the log lines only.
+        """
+        try:
+            identity = _FileIdentity.of(os.stat(path))
+        except OSError as exc:
+            self._report(path, exc, file_env, env)
+            return None
+        with self._lock:
+            cached = self._loaded.get(path)
+        if cached is not None and cached[0] == identity:
+            return cached[1]
+        try:
+            # The identity recorded is the descriptor's, not the earlier `stat`'s: a rename between the two would otherwise file the new contents under the old identity and never reload them.
+            with open(path, "rb") as handle:
+                identity = _FileIdentity.of(os.fstat(handle.fileno()))
+                raw = handle.read().decode("utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            self._report(path, exc, file_env, env)
+            return None
+        entries = _parse_destinations(raw)
+        with self._lock:
+            self._loaded[path] = (identity, entries)
+            recovered = self._reported.pop(path, None) is not None
+        logger.info(
+            "%s: %s %s, %d host(s) and %d origin(s)",
+            file_env,
+            "read again after failing:" if recovered else "loaded",
+            path,
+            len(entries[0]),
+            len(entries[1]),
+        )
+        return entries
+
+    def _report(self, path: str, exc: Exception, file_env: str, env: str) -> None:
+        """Log a failure once, until it changes or the file is read again."""
+        failure = (type(exc).__name__, getattr(exc, "errno", None))
+        with self._lock:
+            # A file that cannot be read must not keep admitting what it used to list, so its last good contents are forgotten, not served.
+            self._loaded.pop(path, None)
+            if self._reported.get(path) == failure:
+                return
+            self._reported[path] = failure
+        logger.warning(
+            "%s: cannot read %s (%s). Until it can be read, only the entries in "
+            "%s are allowlisted (none when it is unset) and every other "
+            "x-headroom-base-url is rejected with 400.",
+            file_env,
+            path,
+            exc,
+            env,
+        )
+
+
+_ALLOWLIST_FILES = _AllowlistFiles()
+
+_SEPARATORS = re.compile(r"[,\n]")
+
+
+def _parse_destinations(raw: str) -> Destinations:
+    """Parse hosts and URLs separated by commas and/or newlines.
+
+    Entries that are neither a host nor a URL with a safe scheme are skipped, so a list of nothing valid is an empty allowlist, not an absent one.
+    """
     hosts: set[str] = set()
     origins: set[tuple[str, str, int]] = set()
-    for item in raw.split(","):
+    for item in _SEPARATORS.split(raw):
         item = item.strip()
         if not item:
             continue
@@ -233,11 +361,32 @@ def allowlisted_destinations(
         if port is None:
             port = 443 if parsed.scheme.lower() in {"https", "wss"} else 80
         origins.add((parsed.scheme.lower(), parsed.hostname.lower(), port))
-    return hosts, origins
+    return frozenset(hosts), frozenset(origins)
+
+
+def allowlisted_destinations(
+    env: str = ALLOWED_BASE_URLS_ENV,
+    file_env: str | None = ALLOWED_BASE_URLS_FILE_ENV,
+) -> Destinations | None:
+    """Return the operator's allowlist from ``env`` and the file ``file_env`` names.
+
+    ``None`` means no allowlist at all: neither variable is set (or each is blank), and the caller applies its default policy. Anything else is allowlist mode, possibly with nothing listed. Once ``file_env`` names a file the result is never ``None``, even when the file is empty, missing or unreadable; see the module docstring for why. Pass ``file_env=None`` for a list that has no file form.
+    """
+    raw = os.environ.get(env)
+    listed = _parse_destinations(raw) if raw and raw.strip() else None
+    if file_env is None:
+        return listed
+    path = (os.environ.get(file_env) or "").strip()
+    if not path:
+        return listed
+    from_file = _ALLOWLIST_FILES.load(path, file_env, env) or _NO_DESTINATIONS
+    if listed is None:
+        return from_file
+    return listed[0] | from_file[0], listed[1] | from_file[1]
 
 
 def destination_listed(
-    allow: tuple[set[str], set[tuple[str, str, int]]],
+    allow: Destinations,
     scheme: str,
     host: str,
     port: int | None,
