@@ -31,6 +31,19 @@ def _replace(path: Path, text: str) -> None:
     os.replace(staging, path)
 
 
+def _count_reads(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record every path the guard actually opens and reads from here on."""
+    reads: list[str] = []
+    real_read = upstream_guard._read_allowlist_file
+
+    def counting_read(path: str):  # noqa: ANN202
+        reads.append(path)
+        return real_read(path)
+
+    monkeypatch.setattr(upstream_guard, "_read_allowlist_file", counting_read)
+    return reads
+
+
 @pytest.fixture
 def allow_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     path = tmp_path / "allowed-base-urls"
@@ -61,15 +74,7 @@ def test_an_unchanged_file_is_not_read_again(
     allow_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _replace(allow_file, "http://127.0.0.1:4100")
-    reads: list[str] = []
-    real_open = open
-
-    def counting_open(file: object, *args: object, **kwargs: object):  # noqa: ANN202
-        if str(file) == str(allow_file):
-            reads.append(str(file))
-        return real_open(file, *args, **kwargs)  # type: ignore[call-overload]
-
-    monkeypatch.setattr(upstream_guard, "open", counting_open, raising=False)
+    reads = _count_reads(monkeypatch)
 
     for _ in range(5):
         assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
@@ -238,6 +243,57 @@ def test_a_malformed_variable_entry_is_skipped_not_fatal(
         assert is_safe_upstream_url("https://gateway.internal/v1") is True
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert warnings == [f"{LIST_ENV}: skipped 1 invalid entry"]
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs FIFOs")
+def test_a_fifo_at_the_path_is_refused_without_blocking(
+    allow_file: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Opening a FIFO for reading blocks until a writer appears; the check must not."""
+    caplog.set_level(logging.WARNING, logger="headroom.proxy.upstream_guard")
+    monkeypatch.setenv(LIST_ENV, "gateway.internal")
+    os.mkfifo(allow_file)
+    results: list[bool] = []
+
+    def check() -> None:
+        results.append(is_safe_upstream_url("http://127.0.0.1:4100/v1"))
+        results.append(is_safe_upstream_url("https://gateway.internal/v1"))
+
+    worker = threading.Thread(target=check, daemon=True)
+    worker.start()
+    worker.join(timeout=5)
+
+    if worker.is_alive():
+        # Release the blocked open so the daemon thread does not outlive the test.
+        with open(allow_file, "w", encoding="utf-8"):
+            pass
+        pytest.fail("the check blocked opening a FIFO")
+    assert results == [False, True]
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "not a regular file" in warnings[0]
+
+
+def test_an_oversized_file_is_refused_whole_not_truncated(
+    allow_file: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Its first bytes alone would be a valid list; the file as a whole is not one."""
+    caplog.set_level(logging.WARNING, logger="headroom.proxy.upstream_guard")
+    head = "http://127.0.0.1:4100\n"
+    padding = "\n" * (upstream_guard._MAX_ALLOWLIST_FILE_BYTES + 1 - len(head))
+    _replace(allow_file, head + padding)
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert f"larger than {upstream_guard._MAX_ALLOWLIST_FILE_BYTES} bytes" in warnings[0]
+
+
+def test_a_file_exactly_at_the_size_cap_is_read(allow_file: Path) -> None:
+    head = "http://127.0.0.1:4100\n"
+    _replace(allow_file, head + "\n" * (upstream_guard._MAX_ALLOWLIST_FILE_BYTES - len(head)))
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
 
 
 def test_a_blank_file_variable_is_treated_as_unset(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -71,6 +71,7 @@ import logging
 import os
 import re
 import socket
+import stat
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -264,6 +265,34 @@ class _FileIdentity:
         return cls(st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
+# The longest entry worth listing is a URL origin: "https://", a 253-character DNS name (or a bracketed IPv6 literal, shorter), ":65535" and a separator, about 270 bytes. One MiB holds several thousand of those, orders of magnitude beyond any operator's allowlist, while bounding the memory and parse work one reload can cost. A file past it is a wrong path (a log, a binary) rather than a list, and it is refused whole: reading only a prefix could turn it into a different, valid-looking list.
+_MAX_ALLOWLIST_FILE_BYTES = 1 << 20
+
+# `os.open` flag that keeps a FIFO at the path from blocking the open until a writer appears. Windows has neither FIFOs nor the flag.
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+
+
+class _UnusableAllowlistFile(Exception):
+    """The path opened, but what it names must not be read as an allowlist."""
+
+
+def _read_allowlist_file(path: str) -> tuple[_FileIdentity, bytes]:
+    """Return the identity of the file read and its bytes.
+
+    Raises ``OSError`` when it cannot be opened or read, and :class:`_UnusableAllowlistFile` when it is not a regular file (a FIFO would block the read until a writer appeared, a device could stream without end) or is larger than ``_MAX_ALLOWLIST_FILE_BYTES``.
+    """
+    fd = os.open(path, os.O_RDONLY | _O_NONBLOCK)
+    with os.fdopen(fd, "rb") as handle:
+        st = os.fstat(handle.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise _UnusableAllowlistFile("not a regular file")
+        # One byte past the cap, so a file that grew after the `fstat` is still caught.
+        data = handle.read(_MAX_ALLOWLIST_FILE_BYTES + 1)
+    if len(data) > _MAX_ALLOWLIST_FILE_BYTES:
+        raise _UnusableAllowlistFile(f"larger than {_MAX_ALLOWLIST_FILE_BYTES} bytes")
+    return _FileIdentity.of(st), data
+
+
 class _AllowlistFiles:
     """Parsed allowlist files, re-read only when a file's identity changes.
 
@@ -273,7 +302,7 @@ class _AllowlistFiles:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._loaded: dict[str, tuple[_FileIdentity, Destinations]] = {}
-        self._reported: dict[str, tuple[str, int | None]] = {}
+        self._reported: dict[str, tuple[str, str]] = {}
 
     def load(self, path: str, file_env: str, env: str) -> Destinations | None:
         """Return ``path``'s entries, or ``None`` when it cannot be read.
@@ -292,10 +321,9 @@ class _AllowlistFiles:
             return cached[1]
         try:
             # The identity recorded is the descriptor's, not the earlier `stat`'s: a rename between the two would otherwise file the new contents under the old identity and never reload them.
-            with open(path, "rb") as handle:
-                identity = _FileIdentity.of(os.fstat(handle.fileno()))
-                raw = handle.read().decode("utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
+            identity, data = _read_allowlist_file(path)
+            raw = data.decode("utf-8")
+        except (OSError, UnicodeDecodeError, _UnusableAllowlistFile) as exc:
             self._report(path, exc, file_env, env)
             return None
         entries, skipped = _parse_destinations(raw)
@@ -317,7 +345,7 @@ class _AllowlistFiles:
 
     def _report(self, path: str, exc: Exception, file_env: str, env: str) -> None:
         """Log a failure once, until it changes or the file is read again."""
-        failure = (type(exc).__name__, getattr(exc, "errno", None))
+        failure = (type(exc).__name__, str(exc))
         with self._lock:
             # A file that cannot be read must not keep admitting what it used to list, so its last good contents are forgotten, not served.
             self._loaded.pop(path, None)
