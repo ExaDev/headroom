@@ -355,6 +355,25 @@ def test_a_hash_entry_in_the_variable_is_not_a_comment(monkeypatch: pytest.Monke
     assert is_safe_upstream_url("https://gateway.internal/v1") is False
 
 
+def test_the_identity_cached_is_the_one_read_not_the_one_first_stat_ed(
+    allow_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rename between the guard's ``stat`` and its ``open`` must not cost a second read."""
+    _replace(allow_file, "http://127.0.0.1:4100")
+    real_read = upstream_guard._read_allowlist_file
+
+    def replaced_after_stat(path: str):  # noqa: ANN202
+        _replace(allow_file, "http://127.0.0.1:4200")
+        return real_read(path)
+
+    monkeypatch.setattr(upstream_guard, "_read_allowlist_file", replaced_after_stat)
+    assert is_safe_upstream_url("http://127.0.0.1:4200/v1") is True
+
+    reads = _count_reads(monkeypatch)
+    assert is_safe_upstream_url("http://127.0.0.1:4200/v1") is True
+    assert reads == []
+
+
 def test_a_blank_file_variable_is_treated_as_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(FILE_ENV, "  ")
 
