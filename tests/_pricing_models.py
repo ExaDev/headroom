@@ -3,13 +3,19 @@
 ``litellm.model_cost`` is downloaded from GitHub at import time, so it is live
 third-party data. BerriAI prunes retired models from it: on 2026-09-23
 ``claude-sonnet-4-20250514`` disappeared and every test that priced it began
-failing with ``KeyError: 'input_cost_per_token'`` — on every open pull request
-at once, with no change on our side.
+failing with ``KeyError: 'input_cost_per_token'``, on every open pull request
+at once, with no change on our side. Later the first-party ``claude-*`` entries
+lost their ``*_above_200k_tokens`` tier fields altogether (Anthropic ended the
+1M-context beta that carried that premium), so a hardcoded list of first-party
+ids cannot be refreshed to satisfy a test that needs a long-context tier: the
+only ``claude`` entries still carrying it are the Bedrock and Vertex AI rows.
 
 The model id in those tests is incidental. They assert that Headroom's cost
 arithmetic agrees with litellm's numbers, not that any particular model is
-priced correctly, so the fix is to stop naming a specific release and instead
-ask for *a* model carrying the fields the test needs.
+priced correctly, so the helper asks the catalog for *a* Claude model carrying
+the fields the test needs, preferring Anthropic's own rows, then ids with no
+provider or region qualifier, then alphabetical order, so selection is deterministic and needs no
+upkeep as ids retire.
 
 Pinning to the copy of the table vendored in the litellm wheel is not the
 alternative it looks like: the two maps are complementary, not ordered. The
@@ -22,40 +28,44 @@ from __future__ import annotations
 
 import pytest
 
-#: Preference order, newest first. A test takes the first entry that carries
-#: every field it needs, so retiring one is a no-op until the list runs dry.
-_CANDIDATES: tuple[str, ...] = (
-    "claude-sonnet-4-5-20250929",
-    "claude-sonnet-4-5",
-    "claude-sonnet-4-20250514",
-    "claude-opus-4-5-20251101",
-    "claude-opus-4-5",
-)
-
 _BASE_FIELDS = ("input_cost_per_token", "output_cost_per_token")
+
+_FIRST_PARTY_PROVIDER = "anthropic"
+
+
+def _candidate_order(item: tuple[str, dict[str, object]]) -> tuple[bool, bool, str]:
+    """Sort key: first-party rows, then unqualified ids, then alphabetical."""
+    key, info = item
+    return (
+        info.get("litellm_provider") != _FIRST_PARTY_PROVIDER,
+        "/" in key or "." in key,
+        key,
+    )
 
 
 def anthropic_pricing_model(*required_fields: str) -> str:
-    """Return a currently-priced Anthropic model carrying ``required_fields``.
+    """Return a currently-priced Claude model carrying ``required_fields``.
 
     Always includes the base input/output costs. Raises with an actionable
-    message rather than skipping: if litellm prices none of these, the pricing
-    tests are not measuring anything and that should be loud.
+    message rather than skipping: if litellm prices no Claude model with these
+    fields, the pricing tests are not measuring anything and that should be
+    loud.
     """
     import litellm
 
     needed = set(_BASE_FIELDS) | set(required_fields)
-    for model in _CANDIDATES:
-        info = litellm.model_cost.get(model)
-        if isinstance(info, dict) and needed <= set(info):
-            return model
-
-    raise AssertionError(
-        "litellm prices none of the candidate models with the fields "
-        f"{sorted(needed)}. It most likely retired them from "
-        "model_prices_and_context_window.json; add a current model id to "
-        "_CANDIDATES in tests/_pricing_models.py (newest first)."
-    )
+    matches = [
+        (key, info)
+        for key, info in litellm.model_cost.items()
+        if "claude" in key and isinstance(info, dict) and needed <= set(info)
+    ]
+    if not matches:
+        raise AssertionError(
+            f"litellm prices no Claude model with the fields {sorted(needed)}. "
+            "It most likely dropped them from model_prices_and_context_window.json; "
+            "check which fields current Claude rows carry before changing the test."
+        )
+    return min(matches, key=_candidate_order)[0]
 
 
 @pytest.fixture(scope="session")

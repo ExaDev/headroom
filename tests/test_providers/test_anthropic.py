@@ -2,6 +2,8 @@
 
 import pytest
 
+from tests._pricing_models import anthropic_pricing_model
+
 
 class TestAnthropicModelSanitization:
     def test_sanitize_model_id_removes_ansi_escape_sequences(self):
@@ -122,9 +124,14 @@ class TestLongContextPricing:
 
     @pytest.mark.parametrize(("input_tokens", "output_tokens", "cached_tokens", "expected"), _CASES)
     def test_litellm_path(self, provider, input_tokens, output_tokens, cached_tokens, expected):
-        cost = provider.estimate_cost(
-            input_tokens, output_tokens, "claude-sonnet-4-5", cached_tokens
+        # The first-party catalog rows no longer carry the above-200k tier, so
+        # the LiteLLM path is exercised through a Claude Sonnet 4.x row that does.
+        model = anthropic_pricing_model(
+            "input_cost_per_token_above_200k_tokens",
+            "output_cost_per_token_above_200k_tokens",
+            "cache_read_input_token_cost_above_200k_tokens",
         )
+        cost = provider.estimate_cost(input_tokens, output_tokens, model, cached_tokens)
         assert cost == pytest.approx(expected, rel=1e-4)
 
     @pytest.mark.parametrize(("input_tokens", "output_tokens", "cached_tokens", "expected"), _CASES)

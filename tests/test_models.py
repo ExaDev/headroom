@@ -288,10 +288,16 @@ class TestBuiltInModels:
         assert info.context_window == 200000
         # Pricing comes from litellm's live table, so name a model it currently
         # prices; the retired-id path is the MODEL_ALIASES assertion below.
-        pricing = ModelRegistry.get_pricing(anthropic_pricing_model())
+        import litellm
+
+        priced = anthropic_pricing_model()
+        pricing = ModelRegistry.get_pricing(priced)
         assert pricing is not None
-        assert pricing[0] == 3.00  # input cost per 1M
-        assert pricing[1] == 15.00  # output cost per 1M
+        # The registry reports per-1M rates read from litellm's table.
+        assert pricing[0] == pytest.approx(litellm.model_cost[priced]["input_cost_per_token"] * 1e6)
+        assert pricing[1] == pytest.approx(
+            litellm.model_cost[priced]["output_cost_per_token"] * 1e6
+        )
         # Retired model alias should also resolve
         alias_pricing = ModelRegistry.get_pricing("claude-3-5-sonnet-20241022")
         assert alias_pricing is not None
