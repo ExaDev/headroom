@@ -411,6 +411,20 @@ _SEPARATORS = re.compile(r"[,\n\r\t]")
 _COMMENT = re.compile(r"(?:^|(?<=[ \t\r\n]))#[^\r\n]*")
 
 
+def _parse_bare_host(item: str) -> str | None:
+    """Return ``item`` as a lowercased host if it is a hostname and nothing else.
+
+    A bare host admits every port on that host, so anything more than the name is refused rather than read as one: a port, even an empty one (``127.0.0.1:4100``, ``127.0.0.1:``), would admit far more than it names; a path (``gw.internal/v1``), userinfo (``user@gw.internal``), query or fragment means the entry was meant as something it is not. An exact origin is written as a URL. Raises ``ValueError`` where ``urlparse`` does.
+    """
+    parsed = urlparse(f"//{item}")
+    if parsed.netloc != item or "@" in item or not parsed.hostname:
+        return None
+    # Outside the brackets of an IPv6 literal, a colon can only introduce a port.
+    if ":" in (item[item.index("]") + 1 :] if item.startswith("[") else item):
+        return None
+    return parsed.hostname.lower()
+
+
 def _parse_entry(item: str) -> str | tuple[str, str, int] | None:
     """Return a bare host, an exact ``(scheme, host, port)`` origin, or ``None`` for neither."""
     if any(character.isspace() for character in item):
@@ -418,11 +432,7 @@ def _parse_entry(item: str) -> str | tuple[str, str, int] | None:
         return None
     try:
         if "://" not in item:
-            bare = urlparse(f"//{item}")
-            if bare.port is not None:
-                # A bare host admits every port, so "127.0.0.1:4100" read that way would admit far more than it names, and read as an origin it would have to guess the scheme. It is neither: the entry is invalid, and an exact origin is written as a URL.
-                return None
-            return bare.hostname.lower() if bare.hostname else None
+            return _parse_bare_host(item)
         parsed = urlparse(item)
         scheme = parsed.scheme.lower()
         if scheme not in _SAFE_SCHEMES or not parsed.hostname:
