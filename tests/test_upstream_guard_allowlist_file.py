@@ -600,6 +600,41 @@ def test_only_newline_and_carriage_return_end_a_comment(allow_file: Path) -> Non
     assert is_safe_upstream_url("http://127.0.0.1:4300/v1") is False
 
 
+@pytest.mark.parametrize(
+    "bare",
+    [
+        "127.0.0.1:",
+        "[::1]:",
+        "gw.internal/v1",
+        "gw.internal/",
+        "user@gw.internal",
+        "user:pw@gw.internal",
+        "gw.internal?x=1",
+        "gw.internal#frag",
+    ],
+)
+def test_a_bare_entry_with_anything_but_a_hostname_is_invalid(
+    allow_file: Path, monkeypatch: pytest.MonkeyPatch, bare: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="headroom.proxy.upstream_guard")
+    _replace(allow_file, bare + "\n")
+    monkeypatch.setenv(LIST_ENV, bare)
+
+    for host in ("127.0.0.1", "[::1]", "gw.internal"):
+        assert is_safe_upstream_url(f"http://{host}:4100/v1") is False
+    assert any("1 invalid entry skipped" in r.getMessage() for r in caplog.records)
+    assert any(r.getMessage() == f"{LIST_ENV}: skipped 1 invalid entry" for r in caplog.records)
+
+
+@pytest.mark.parametrize("bare", ["gw.internal", "GW.Internal", "127.0.0.1", "[::1]"])
+def test_a_bare_hostname_still_admits_every_port(allow_file: Path, bare: str) -> None:
+    _replace(allow_file, bare + "\n")
+    host = bare.lower()
+
+    assert is_safe_upstream_url(f"http://{host}:4100/v1") is True
+    assert is_safe_upstream_url(f"https://{host}/v1") is True
+
+
 def test_a_blank_file_variable_is_treated_as_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(FILE_ENV, "  ")
 
