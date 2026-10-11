@@ -10,7 +10,7 @@ Policy:
     or otherwise non-public addresses. Public hosts (api.openai.com, api.x.ai,
     Azure, ...) are allowed so ordinary BYOK keeps working.
   * When ``HEADROOM_ALLOWED_BASE_URLS`` is set (hosts or URLs separated by
-    commas, newlines, carriage returns or tabs), bare hosts permit every safe scheme/port for that
+    commas, tabs or line breaks), bare hosts permit every safe scheme/port for that
     host, while URLs permit only their exact normalized origin. A scheme-less
     entry must be a hostname and nothing else: one with a port (even an empty
     one), a path, userinfo, a query or a fragment is skipped as invalid, as is
@@ -19,8 +19,9 @@ Policy:
     point at internal/on-prem endpoints.
   * ``HEADROOM_ALLOWED_BASE_URLS_FILE`` (or ``headroom proxy
     --allowed-base-urls-file``) names a file holding more entries in the same
-    format, plus ``#`` comments (from a ``#`` at the start of a line or after
-    whitespace, to the end of the line) and an optional byte-order mark,
+    format, plus ``#`` comments (from a ``#`` at the start of the file or
+    after any whitespace, to the next line break; see ``_COMMENT``) and an
+    optional byte-order mark,
     merged with the variable's. The variable is fixed for the
     life of the process; the file is re-read whenever it changes, so a
     supervisor whose own listed endpoint moves (a loopback port chosen at
@@ -404,7 +405,7 @@ class _AllowlistFiles:
 
     A version that could not be used is cached too, as ``None``, so a file that is oversized, not UTF-8 or unreadable costs one ``stat`` per check like a good one, not an open and a read on every request. A failure that is not the file's own (see ``_FILE_ERRNOS``) is not cached: that check fails closed and the next one tries again.
 
-    Thread-safe: the event loop and the resolver pool both reach the guard. Checks against an unchanged file take only the bookkeeping lock. Checks that see a change queue on one reload lock and re-check the cache once they hold it, so a change is read and logged once however many requests arrive together; the wait is bounded by one read of at most ``_MAX_ALLOWLIST_FILE_BYTES``.
+    Thread-safe: the event loop and the resolver pool both reach the guard. Checks against an unchanged file take only the bookkeeping lock. Checks that see a change queue on one reload lock and re-check the cache once they hold it, so a change is read and logged once however many requests arrive together. The wait is bounded in bytes (one read of at most ``_MAX_ALLOWLIST_FILE_BYTES``), not in time: a file on a stalled mount holds the reload, and every check that saw the change, for as long as the filesystem does, and a synchronous caller of :func:`is_safe_upstream_url` on the event loop blocks the loop meanwhile, as it already would on the ``stat``. Event-loop callers should use :func:`is_safe_upstream_url_async`, which runs the check on a worker thread.
     """
 
     def __init__(self) -> None:
