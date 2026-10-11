@@ -163,6 +163,36 @@ class TestApplyToEnviron:
         assert os.environ["HEADROOM_CODE_AWARE_ENABLED"] == "0"
 
 
+class TestNulCharacters:
+    """An environment value cannot hold NUL, so a stored one must never reach ``os.environ``."""
+
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("allowed_base_urls_file", "/run/allow\x00ed"),
+            ("openai_base_url", "http://a\x00b"),
+            ("proxy_extensions", ["a\x00b"]),
+        ],
+    )
+    def test_validate_rejects_a_nul_in_a_string(self, workspace, key, value):
+        with pytest.raises(settings_store.SettingsValidationError) as excinfo:
+            settings_store.validate({key: value})
+        assert key in excinfo.value.field_errors
+
+    def test_a_stored_nul_is_dropped_and_later_settings_still_apply(self, workspace, monkeypatch):
+        _clear_env(monkeypatch)
+        paths.settings_path().write_text(
+            json.dumps({"allowed_base_urls_file": "/run/allow\x00ed", "port": 9898}),
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        settings_store.apply_to_environ(settings_store.load())
+
+        assert "HEADROOM_ALLOWED_BASE_URLS_FILE" not in os.environ
+        assert os.environ["HEADROOM_PORT"] == "9898"
+
+
 class TestEffectiveValues:
     def test_default_then_file_then_env(self, workspace, monkeypatch):
         _clear_env(monkeypatch)

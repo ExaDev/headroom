@@ -828,7 +828,9 @@ def _coerce(field: SettingField, value: Any) -> Any:
         tokens = value if isinstance(value, list | tuple) else str(value).split(",")
         tokens = [str(token).strip() for token in tokens]
         tokens = [token for token in tokens if token]
-        return ",".join(tokens) if tokens else None
+        joined = ",".join(tokens)
+        _refuse_nul(joined)
+        return joined if tokens else None
     if field.type == "header-map":
         if isinstance(value, dict):
             parsed = value
@@ -844,7 +846,17 @@ def _coerce(field: SettingField, value: Any) -> Any:
         return json.dumps(parsed, sort_keys=True) if parsed else None
     # str
     token = str(value)
+    _refuse_nul(token)
     return token if token != "" else None
+
+
+def _refuse_nul(token: str) -> None:
+    """Raise ``ValueError`` for a NUL, which no environment variable can hold.
+
+    ``apply_to_environ`` sets ``os.environ`` key by key, and a NUL there raises mid-loop, dropping every stored setting after it; refusing it here makes ``load`` skip just that key and ``validate`` report it.
+    """
+    if "\x00" in token:
+        raise ValueError("must not contain a NUL character")
 
 
 def _serialize(field: SettingField, value: Any) -> str:
