@@ -713,6 +713,52 @@ def test_a_root_owned_file_in_a_root_owned_directory_is_accepted(
     assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
 
 
+@_POSIX_USER
+def test_a_symlink_into_a_shared_directory_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The link sits in a private directory, but whoever can write the target's directory can replace the file."""
+    caplog.set_level(logging.WARNING, logger="headroom.proxy.upstream_guard")
+    private, shared = tmp_path / "private", tmp_path / "shared"
+    private.mkdir(mode=0o700)
+    shared.mkdir()
+    _replace(shared / "allowed", "http://127.0.0.1:4100")
+    (private / "allowed").symlink_to(shared / "allowed")
+    monkeypatch.setenv(FILE_ENV, str(private / "allowed"))
+    shared.chmod(0o777)
+    try:
+        assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+    finally:
+        shared.chmod(0o700)
+    (warning,) = [r.getMessage() for r in caplog.records]
+    assert (
+        "the directory of the file its symlink resolves to is writable by group or others (mode 0777)"
+        in warning
+    )
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+
+
+@_POSIX_USER
+def test_a_symlink_in_a_shared_directory_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger="headroom.proxy.upstream_guard")
+    private, shared = tmp_path / "private", tmp_path / "shared"
+    private.mkdir(mode=0o700)
+    shared.mkdir()
+    _replace(private / "allowed", "http://127.0.0.1:4100")
+    (shared / "allowed").symlink_to(private / "allowed")
+    monkeypatch.setenv(FILE_ENV, str(shared / "allowed"))
+    shared.chmod(0o777)
+    try:
+        assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+    finally:
+        shared.chmod(0o700)
+    (warning,) = [r.getMessage() for r in caplog.records]
+    assert "its directory is writable by group or others (mode 0777)" in warning
+
+
 def test_concurrent_checks_after_a_change_read_and_log_it_once(
     allow_file: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

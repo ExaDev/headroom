@@ -349,17 +349,30 @@ def _require_private(
         raise _UnusableAllowlistFile(f"the file is {problem.description}", identity)
     if not directory:
         return
-    parent = os.path.dirname(path)
-    try:
-        parent_st = os.stat(parent)
-    except OSError as exc:
-        raise _UnusableAllowlistFile.from_os_error(exc, identity) from exc
-    # A sticky shared directory (/tmp style) is acceptable because the file was just checked: owned by this user or root and not writable by others, so nobody else may unlink or rename it there.
-    problem = foreign_write_access(parent_st, root_may_own=True, sticky_may_share=True)
-    if problem is not None:
-        raise _UnusableAllowlistFile(
-            f"its directory is {problem.description}", identity, lasting=False
-        )
+    for parent, which in _allowlist_directories(path):
+        try:
+            parent_st = os.stat(parent)
+        except OSError as exc:
+            raise _UnusableAllowlistFile.from_os_error(exc, identity) from exc
+        # A sticky shared directory (/tmp style) is acceptable because the file was just checked: owned by this user or root and not writable by others, so nobody else may unlink or rename it there.
+        problem = foreign_write_access(parent_st, root_may_own=True, sticky_may_share=True)
+        if problem is not None:
+            raise _UnusableAllowlistFile(
+                f"{which} is {problem.description}", identity, lasting=False
+            )
+
+
+def _allowlist_directories(path: str) -> list[tuple[str, str]]:
+    """The directories whose write access could replace the file ``path`` names, each with how to describe it.
+
+    The directory holding ``path`` itself, where whoever can write could replace the entry there, and, when that entry is a symlink (or a chain of them) to a file elsewhere, the directory holding the file it resolves to, where whoever can write could replace the file. Symlinks among the directories' own ancestors (``/tmp`` to ``/private/tmp`` on macOS) do not count as a second directory: both resolve to the same place, which is checked once.
+    """
+    link_directory = os.path.dirname(path)
+    target_directory = os.path.dirname(os.path.realpath(path))
+    directories = [(link_directory, "its directory")]
+    if target_directory != os.path.realpath(link_directory):
+        directories.append((target_directory, "the directory of the file its symlink resolves to"))
+    return directories
 
 
 def _read_allowlist_file(path: str, st: os.stat_result) -> tuple[_FileIdentity, str]:
