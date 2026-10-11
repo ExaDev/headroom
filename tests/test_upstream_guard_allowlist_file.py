@@ -296,6 +296,30 @@ def test_a_file_exactly_at_the_size_cap_is_read(allow_file: Path) -> None:
     assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
 
 
+@pytest.mark.parametrize("bare", ["127.0.0.1:4100", "[::1]:4100", "gateway.internal:8443"])
+def test_a_bare_host_with_a_port_is_invalid_in_the_file(
+    allow_file: Path, bare: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Read as a bare host it would admit every port on that host."""
+    caplog.set_level(logging.INFO, logger="headroom.proxy.upstream_guard")
+    _replace(allow_file, bare)
+    host = bare.rsplit(":", 1)[0]
+
+    assert is_safe_upstream_url(f"http://{host}:4100/v1") is False
+    assert is_safe_upstream_url(f"http://{host}:9999/v1") is False
+    assert any("1 invalid entry skipped" in r.getMessage() for r in caplog.records)
+
+
+def test_a_bare_host_with_a_port_is_invalid_in_the_variable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(LIST_ENV, "127.0.0.1:4100,gateway.internal")
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+    assert is_safe_upstream_url("http://127.0.0.1:9999/v1") is False
+    assert is_safe_upstream_url("https://gateway.internal:8443/v1") is True
+
+
 def test_a_blank_file_variable_is_treated_as_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(FILE_ENV, "  ")
 

@@ -11,9 +11,10 @@ Policy:
     Azure, ...) are allowed so ordinary BYOK keeps working.
   * When ``HEADROOM_ALLOWED_BASE_URLS`` is set (hosts or URLs separated by
     commas and/or newlines), bare hosts permit every safe scheme/port for that
-    host, while URLs permit only their exact normalized origin. Because that is
-    an explicit operator choice, allowlisted destinations may point at
-    internal/on-prem endpoints.
+    host, while URLs permit only their exact normalized origin. A bare host
+    with a port (``127.0.0.1:4100``) is neither and is skipped as invalid.
+    Because that is an explicit operator choice, allowlisted destinations may
+    point at internal/on-prem endpoints.
   * ``HEADROOM_ALLOWED_BASE_URLS_FILE`` names a file holding more entries in the
     same format, merged with the variable's. The variable is fixed for the
     life of the process; the file is re-read whenever it changes, so a
@@ -372,8 +373,11 @@ def _parse_entry(item: str) -> str | tuple[str, str, int] | None:
     """Return a bare host, an exact ``(scheme, host, port)`` origin, or ``None`` for neither."""
     try:
         if "://" not in item:
-            hostname = urlparse(f"//{item}").hostname
-            return hostname.lower() if hostname else None
+            bare = urlparse(f"//{item}")
+            if bare.port is not None:
+                # A bare host admits every port, so "127.0.0.1:4100" read that way would admit far more than it names, and read as an origin it would have to guess the scheme. It is neither: the entry is invalid, and an exact origin is written as a URL.
+                return None
+            return bare.hostname.lower() if bare.hostname else None
         parsed = urlparse(item)
         scheme = parsed.scheme.lower()
         if scheme not in _SAFE_SCHEMES or not parsed.hostname:
