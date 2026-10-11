@@ -270,10 +270,10 @@ def dashboard(port: int, no_open: bool) -> None:
     envvar="HEADROOM_ALLOWED_BASE_URLS_FILE",
     help=(
         "File of upstream hosts and URLs that x-headroom-base-url may name, in "
-        "the HEADROOM_ALLOWED_BASE_URLS format (commas, newlines or tabs between "
-        "entries, # comments), merged with that variable. Re-read whenever "
+        "the HEADROOM_ALLOWED_BASE_URLS format (commas, tabs or line breaks between "
+        "entries) plus # comments, merged with that variable. Re-read whenever "
         "it changes, with no restart; replace it atomically. Naming it means "
-        "allowlist mode even while it is empty, missing or unreadable "
+        "allowlist mode even while it is empty, missing or unreadable. "
         "A blank value means no file (env: HEADROOM_ALLOWED_BASE_URLS_FILE)."
     ),
 )

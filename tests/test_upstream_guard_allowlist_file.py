@@ -821,6 +821,22 @@ def test_a_bare_hostname_still_admits_every_port(allow_file: Path, bare: str) ->
     assert is_safe_upstream_url(f"https://{host}/v1") is True
 
 
+def test_a_hash_after_an_origin_in_a_url_is_its_fragment(allow_file: Path) -> None:
+    """What the docs promise: the fragment is ignored and the origin is listed."""
+    _replace(allow_file, "http://127.0.0.1:4100#x\n")
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+
+
+def test_a_hash_in_the_variable_hides_nothing_after_a_comma(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(LIST_ENV, "gw.example #note, http://127.0.0.1:4100")
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+    assert is_safe_upstream_url("https://gw.example/v1") is False
+
+
 def test_a_blank_file_variable_is_treated_as_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(FILE_ENV, "  ")
 
@@ -1017,3 +1033,6 @@ class TestCliOption:
 
         assert "--allowed-base-urls-file" in result.output
         assert "HEADROOM_ALLOWED_BASE_URLS_FILE" in result.output
+        assert "missing or unreadable. A blank value means no file" in " ".join(
+            result.output.split()
+        )
