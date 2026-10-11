@@ -545,7 +545,7 @@ def test_the_guard_expands_a_home_relative_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
-    upstream_guard.resolve_allowlist_file_path.cache_clear()
+    upstream_guard._RESOLVED_ALLOWLIST_PATHS.clear()
     _replace(tmp_path / "allowed", "http://127.0.0.1:4100")
     monkeypatch.setenv(FILE_ENV, "~/allowed")
 
@@ -555,7 +555,7 @@ def test_the_guard_expands_a_home_relative_path(
 def test_a_relative_path_keeps_the_directory_of_its_first_use(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    upstream_guard.resolve_allowlist_file_path.cache_clear()
+    upstream_guard._RESOLVED_ALLOWLIST_PATHS.clear()
     first, elsewhere = tmp_path / "first", tmp_path / "elsewhere"
     first.mkdir()
     elsewhere.mkdir()
@@ -827,6 +827,36 @@ def test_without_geteuid_ownership_is_not_judged(
         assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
     finally:
         shared.chmod(0o700)
+
+
+def test_a_relative_path_keeps_its_meaning_however_many_others_are_resolved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    upstream_guard._RESOLVED_ALLOWLIST_PATHS.clear()
+    first, elsewhere = tmp_path / "first", tmp_path / "elsewhere"
+    first.mkdir()
+    elsewhere.mkdir()
+    monkeypatch.chdir(first)
+    resolved = upstream_guard.resolve_allowlist_file_path("allowed")
+
+    for n in range(64):
+        upstream_guard.resolve_allowlist_file_path(f"other-{n}")
+    monkeypatch.chdir(elsewhere)
+
+    assert (
+        upstream_guard.resolve_allowlist_file_path("allowed") == resolved == str(first / "allowed")
+    )
+
+
+def test_an_unknown_user_s_home_is_left_as_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    upstream_guard._RESOLVED_ALLOWLIST_PATHS.clear()
+    monkeypatch.chdir(tmp_path)
+
+    resolved = upstream_guard.resolve_allowlist_file_path("~no-such-user-headroom/allowed")
+
+    assert resolved == str(tmp_path / "~no-such-user-headroom" / "allowed")
 
 
 def test_concurrent_checks_after_a_change_read_and_log_it_once(
@@ -1161,7 +1191,7 @@ class TestCliOption:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.chdir(tmp_path)
-        upstream_guard.resolve_allowlist_file_path.cache_clear()
+        upstream_guard._RESOLVED_ALLOWLIST_PATHS.clear()
 
         result, seen = self._invoke(["--allowed-base-urls-file", "allowed"], {FILE_ENV: None})
 
@@ -1230,7 +1260,7 @@ class TestCliOption:
         assert seen["allows_public"] == "True"
 
     def test_a_home_relative_path_is_expanded(self, tmp_path: Path) -> None:
-        upstream_guard.resolve_allowlist_file_path.cache_clear()
+        upstream_guard._RESOLVED_ALLOWLIST_PATHS.clear()
         result, seen = self._invoke(
             ["--allowed-base-urls-file", "~/allowed"], {FILE_ENV: None, "HOME": str(tmp_path)}
         )
