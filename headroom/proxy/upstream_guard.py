@@ -11,7 +11,7 @@ Policy:
     Azure, ...) are allowed so ordinary BYOK keeps working.
   * When ``HEADROOM_ALLOWED_BASE_URLS`` is set (hosts or URLs separated by
     commas, tabs or line breaks), bare hosts permit every safe scheme/port for that
-    host, while URLs permit only their exact normalized origin. A scheme-less
+    host, while URLs permit only their exact normalised origin. A scheme-less
     entry must be a hostname and nothing else: one with a port (even an empty
     one), a path, userinfo, a query or a fragment is skipped as invalid, as is
     any entry containing whitespace.
