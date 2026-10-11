@@ -300,6 +300,24 @@ _FILE_ERRNOS = frozenset(
 )
 
 
+def _os_error_reason(exc: OSError) -> str:
+    """Describe ``exc`` without the path it carries, which the log line already shows (truncated)."""
+    if exc.errno is None:
+        return str(exc)
+    return f"{os.strerror(exc.errno)} ({errno.errorcode.get(exc.errno, exc.errno)})"
+
+
+# The path is the operator's, but it comes from an environment variable or stored setting and is otherwise unbounded (PATH_MAX is 1024 bytes on macOS and 4096 on Linux), so a mistaken value could fill a log line. 255 is NAME_MAX, the longest single file name on common filesystems, so the file's own name always survives whole, with as much of its directory as fits.
+_LOGGED_PATH_CHARS = 255
+
+
+def _logged_path(path: str) -> str:
+    """``path`` as a log line shows it: quoted, escaped, and cut to its last ``_LOGGED_PATH_CHARS`` characters."""
+    if len(path) <= _LOGGED_PATH_CHARS:
+        return repr(path)
+    return repr("..." + path[-_LOGGED_PATH_CHARS:])
+
+
 class _UnusableAllowlistFile(Exception):
     """The file at the path cannot be used as an allowlist, and which version of it that was.
 
@@ -313,7 +331,7 @@ class _UnusableAllowlistFile(Exception):
 
     @classmethod
     def from_os_error(cls, exc: OSError, identity: _FileIdentity) -> _UnusableAllowlistFile:
-        return cls(str(exc), identity, lasting=exc.errno in _FILE_ERRNOS)
+        return cls(_os_error_reason(exc), identity, lasting=exc.errno in _FILE_ERRNOS)
 
 
 def _require_private(
@@ -412,7 +430,7 @@ class _AllowlistFiles:
         try:
             st = os.stat(path)
         except OSError as exc:
-            self._report(path, str(exc), file_env, env)
+            self._report(path, _os_error_reason(exc), file_env, env)
             return None
         identity = _FileIdentity.of(st)
         hit, entries = self._cached(path, identity)
@@ -440,7 +458,7 @@ class _AllowlistFiles:
             "%s: %s %s, %d host(s) and %d origin(s), %d invalid entr%s skipped",
             file_env,
             "read again after failing:" if recovered else "loaded",
-            path,
+            _logged_path(path),
             len(entries[0]),
             len(entries[1]),
             skipped,
@@ -461,7 +479,7 @@ class _AllowlistFiles:
             "the catch-all passthrough answer 400, and the OpenAI chat-completions "
             "and responses handlers send the request to the configured upstream.",
             file_env,
-            path,
+            _logged_path(path),
             reason,
             env,
         )

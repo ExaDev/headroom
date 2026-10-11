@@ -128,7 +128,7 @@ def test_a_missing_file_fails_closed_and_is_logged_once(
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
     assert FILE_ENV in warnings[0].getMessage()
-    assert str(allow_file) in warnings[0].getMessage()
+    assert upstream_guard._logged_path(str(allow_file)) in warnings[0].getMessage()
 
     # Once it can be read again it is honoured, and a later failure is a new one worth reporting.
     _replace(allow_file, "http://127.0.0.1:4100")
@@ -631,6 +631,22 @@ def test_a_file_owned_by_another_user_is_refused(
     assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
     (warning,) = [r.getMessage() for r in caplog.records]
     assert f"the file is owned by uid {real_uid}" in warning
+
+
+def test_the_failure_warning_shows_only_the_end_of_a_long_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger="headroom.proxy.upstream_guard")
+    long_path = str(tmp_path / ("d" * 250) / ("e" * 250) / "allowed")
+    monkeypatch.setenv(FILE_ENV, long_path)
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+
+    (warning,) = [r.getMessage() for r in caplog.records]
+    assert long_path not in warning
+    assert repr("..." + long_path[-upstream_guard._LOGGED_PATH_CHARS :]) in warning
+    assert "No such file or directory (ENOENT)" in warning
+    assert "d" * 10 not in warning
 
 
 def test_concurrent_checks_after_a_change_read_and_log_it_once(
