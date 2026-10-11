@@ -75,6 +75,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import functools
 import ipaddress
 import logging
 import os
@@ -527,6 +528,15 @@ def _parse_variable(env: str, raw: str) -> Destinations:
     return destinations
 
 
+@functools.lru_cache(maxsize=16)
+def resolve_allowlist_file_path(raw: str) -> str:
+    """Return the file ``raw`` names, with ``~`` expanded and a relative path made absolute.
+
+    A relative path resolves against the working directory at its first use in this process and keeps that meaning afterwards, so a later change of directory cannot repoint the allowlist. Symlinks are not resolved, so a supervisor may swap a link's target. ``raw`` must already be stripped and not blank.
+    """
+    return os.path.abspath(os.path.expanduser(raw))
+
+
 def allowlisted_destinations(
     env: str = ALLOWED_BASE_URLS_ENV,
     file_env: str | None = ALLOWED_BASE_URLS_FILE_ENV,
@@ -539,9 +549,10 @@ def allowlisted_destinations(
     listed = _parse_variable(env, raw) if raw and raw.strip() else None
     if file_env is None:
         return listed
-    path = (os.environ.get(file_env) or "").strip()
-    if not path:
+    raw_path = (os.environ.get(file_env) or "").strip()
+    if not raw_path:
         return listed
+    path = resolve_allowlist_file_path(raw_path)
     from_file = _ALLOWLIST_FILES.load(path, file_env, env) or _NO_DESTINATIONS
     if listed is None:
         return from_file

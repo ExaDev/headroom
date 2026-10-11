@@ -1372,13 +1372,16 @@ def proxy(
             raise click.ClickException(str(exc)) from None
 
     if allowed_base_urls_file is not None:
-        from headroom.proxy.upstream_guard import ALLOWED_BASE_URLS_FILE_ENV
+        from headroom.proxy.upstream_guard import (
+            ALLOWED_BASE_URLS_FILE_ENV,
+            resolve_allowlist_file_path,
+        )
 
         allowed_base_urls_file = allowed_base_urls_file.strip()
         if allowed_base_urls_file:
-            # The guard reads the environment on every check, in this process and in any worker it spawns, so the option is handed over there. `~` expanded and made absolute, so a later change of working directory cannot repoint it; not symlink-resolved, so a supervisor may swap a link's target.
-            os.environ[ALLOWED_BASE_URLS_FILE_ENV] = os.path.abspath(
-                os.path.expanduser(allowed_base_urls_file)
+            # The guard reads the environment on every check, in this process and in any worker it spawns, so the option is handed over there, resolved the way the guard resolves it so a worker started in another directory still names the same file.
+            os.environ[ALLOWED_BASE_URLS_FILE_ENV] = resolve_allowlist_file_path(
+                allowed_base_urls_file
             )
         else:
             # Blank means no file, as a blank HEADROOM_ALLOWED_BASE_URLS means no list; an explicit `--allowed-base-urls-file ""` also overrides a path inherited from the environment or stored settings.

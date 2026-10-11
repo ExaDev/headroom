@@ -541,6 +541,36 @@ def test_the_openai_chat_handler_ignores_a_refused_override(allow_file: Path) ->
     assert _resolve_openai_upstream_base({"x-headroom-base-url": "http://127.0.0.1:4100"}) is None
 
 
+def test_the_guard_expands_a_home_relative_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    upstream_guard.resolve_allowlist_file_path.cache_clear()
+    _replace(tmp_path / "allowed", "http://127.0.0.1:4100")
+    monkeypatch.setenv(FILE_ENV, "~/allowed")
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+
+
+def test_a_relative_path_keeps_the_directory_of_its_first_use(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    upstream_guard.resolve_allowlist_file_path.cache_clear()
+    first, elsewhere = tmp_path / "first", tmp_path / "elsewhere"
+    first.mkdir()
+    elsewhere.mkdir()
+    _replace(first / "allowed", "http://127.0.0.1:4100")
+    _replace(elsewhere / "allowed", "http://127.0.0.1:4200")
+    monkeypatch.setenv(FILE_ENV, "allowed")
+    monkeypatch.chdir(first)
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+
+    monkeypatch.chdir(elsewhere)
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+    assert is_safe_upstream_url("http://127.0.0.1:4200/v1") is False
+
+
 def test_concurrent_checks_after_a_change_read_and_log_it_once(
     allow_file: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -857,6 +887,7 @@ class TestCliOption:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.chdir(tmp_path)
+        upstream_guard.resolve_allowlist_file_path.cache_clear()
 
         result, seen = self._invoke(["--allowed-base-urls-file", "allowed"], {FILE_ENV: None})
 
@@ -895,6 +926,7 @@ class TestCliOption:
         assert seen is None
 
     def test_a_home_relative_path_is_expanded(self, tmp_path: Path) -> None:
+        upstream_guard.resolve_allowlist_file_path.cache_clear()
         result, seen = self._invoke(
             ["--allowed-base-urls-file", "~/allowed"], {FILE_ENV: None, "HOME": str(tmp_path)}
         )
