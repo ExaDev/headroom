@@ -271,10 +271,10 @@ def dashboard(port: int, no_open: bool) -> None:
     help=(
         "File of upstream hosts and URLs that x-headroom-base-url may name, in "
         "the HEADROOM_ALLOWED_BASE_URLS format (commas, newlines or tabs between "
-        "entries, # comment lines), merged with that variable. Re-read whenever "
+        "entries, # comments), merged with that variable. Re-read whenever "
         "it changes, with no restart; replace it atomically. Naming it means "
         "allowlist mode even while it is empty, missing or unreadable "
-        "(env: HEADROOM_ALLOWED_BASE_URLS_FILE)."
+        "A blank value means no file (env: HEADROOM_ALLOWED_BASE_URLS_FILE)."
     ),
 )
 @click.option(

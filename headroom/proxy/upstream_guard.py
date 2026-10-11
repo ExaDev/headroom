@@ -11,20 +11,26 @@ Policy:
     Azure, ...) are allowed so ordinary BYOK keeps working.
   * When ``HEADROOM_ALLOWED_BASE_URLS`` is set (hosts or URLs separated by
     commas, newlines, carriage returns or tabs), bare hosts permit every safe scheme/port for that
-    host, while URLs permit only their exact normalized origin. A bare host
-    with a port (``127.0.0.1:4100``) is neither and is skipped as invalid.
+    host, while URLs permit only their exact normalized origin. A scheme-less
+    entry must be a hostname and nothing else: one with a port (even an empty
+    one), a path, userinfo, a query or a fragment is skipped as invalid, as is
+    any entry containing whitespace.
     Because that is an explicit operator choice, allowlisted destinations may
     point at internal/on-prem endpoints.
   * ``HEADROOM_ALLOWED_BASE_URLS_FILE`` (or ``headroom proxy
     --allowed-base-urls-file``) names a file holding more entries in the same
-    format, plus ``#`` comment lines and an optional byte-order mark, merged with the variable's. The variable is fixed for the
+    format, plus ``#`` comments (from a ``#`` at the start of a line or after
+    whitespace, to the end of the line) and an optional byte-order mark,
+    merged with the variable's. The variable is fixed for the
     life of the process; the file is re-read whenever it changes, so a
     supervisor whose own listed endpoint moves (a loopback port chosen at
     start-up, say) can rewrite the file instead of restarting a proxy that
     sessions are still using. Replace it atomically (write a sibling, then
     rename over it): a change is detected by the file's identity (device,
     inode, size, and modification and status-change times), and an unchanged
-    file costs one ``stat`` per check, never a read.
+    file costs one ``stat`` per check, never a read. A version that cannot be
+    used is remembered the same way, so a broken file is not re-opened on
+    every request.
 
 Naming a file is itself the operator's choice of allowlist mode, so it never
 falls back to the public-host default, whatever state the file is in:
