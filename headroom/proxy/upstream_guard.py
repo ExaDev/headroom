@@ -67,7 +67,8 @@ question that actually matters, "was *this* request's destination guarded?", so
 a guarded destination with no usable pin is a denial. It also stops one caller's
 pin from being visible to another caller's connection.
 
-This module intentionally depends only on the standard library so it is safe to
+This module intentionally depends only on the standard library (and
+``headroom.proxy.private_paths``, itself standard-library only) so it is safe to
 import from any handler without risking an import cycle.
 """
 
@@ -89,6 +90,8 @@ from concurrent.futures import TimeoutError as _FutureTimeout
 from contextvars import ContextVar
 from dataclasses import dataclass
 from urllib.parse import urlparse
+
+from headroom.proxy.private_paths import foreign_write_access
 
 logger = logging.getLogger(__name__)
 
@@ -313,6 +316,32 @@ class _UnusableAllowlistFile(Exception):
         return cls(str(exc), identity, lasting=exc.errno in _FILE_ERRNOS)
 
 
+def _require_private(
+    path: str, st: os.stat_result, identity: _FileIdentity, *, directory: bool = True
+) -> None:
+    """Raise :class:`_UnusableAllowlistFile` if a user other than this one could change the file.
+
+    The same rule as the ``--uds`` socket's directory (:func:`headroom.proxy.private_paths.foreign_write_access`): another owner, or group or other write permission, on the file itself, or with ``directory``, on the directory that holds the path, whose write permission lets anyone with it replace the file. A permission change on the file moves its status-change time, so that failure is remembered against the file's identity; one on the directory does not, so that failure is retried on every check until it clears. A cached good version is checked again whenever the file changes, which is the only way the directory's write access could reach it. Skipped where there is no ``os.geteuid`` (Windows), which has no POSIX ownership and modes to judge.
+    """
+    if not hasattr(os, "geteuid"):
+        return
+    problem = foreign_write_access(st)
+    if problem is not None:
+        raise _UnusableAllowlistFile(f"the file is {problem.description}", identity)
+    if not directory:
+        return
+    parent = os.path.dirname(path)
+    try:
+        parent_st = os.stat(parent)
+    except OSError as exc:
+        raise _UnusableAllowlistFile.from_os_error(exc, identity) from exc
+    problem = foreign_write_access(parent_st)
+    if problem is not None:
+        raise _UnusableAllowlistFile(
+            f"its directory is {problem.description}", identity, lasting=False
+        )
+
+
 def _read_allowlist_file(path: str, st: os.stat_result) -> tuple[_FileIdentity, str]:
     """Return the identity of the file read and its text; ``st`` is the caller's ``stat`` of it.
 
@@ -321,6 +350,7 @@ def _read_allowlist_file(path: str, st: os.stat_result) -> tuple[_FileIdentity, 
     identity = _FileIdentity.of(st)
     if not stat.S_ISREG(st.st_mode):
         raise _UnusableAllowlistFile("not a regular file", identity)
+    _require_private(path, st, identity)
     try:
         fd = os.open(path, os.O_RDONLY | _O_NONBLOCK | _O_NOCTTY)
     except OSError as exc:
@@ -331,6 +361,7 @@ def _read_allowlist_file(path: str, st: os.stat_result) -> tuple[_FileIdentity, 
         identity = _FileIdentity.of(st)
         if not stat.S_ISREG(st.st_mode):
             raise _UnusableAllowlistFile("not a regular file", identity)
+        _require_private(path, st, identity, directory=False)
         too_large = _UnusableAllowlistFile(
             f"larger than {_MAX_ALLOWLIST_FILE_BYTES} bytes", identity
         )
