@@ -323,11 +323,12 @@ class _AllowlistFiles:
         try:
             # The identity recorded is the descriptor's, not the earlier `stat`'s: a rename between the two would otherwise file the new contents under the old identity and never reload them.
             identity, data = _read_allowlist_file(path)
-            raw = data.decode("utf-8")
+            # utf-8-sig drops the byte-order mark some editors write; without it, the mark would join the first entry and make it invalid.
+            raw = data.decode("utf-8-sig")
         except (OSError, UnicodeDecodeError, _UnusableAllowlistFile) as exc:
             self._report(path, exc, file_env, env)
             return None
-        entries, skipped = _parse_destinations(raw)
+        entries, skipped = _parse_destinations(raw, comments=True)
         with self._lock:
             self._loaded[path] = (identity, entries)
             recovered = self._reported.pop(path, None) is not None
@@ -366,7 +367,7 @@ class _AllowlistFiles:
 
 _ALLOWLIST_FILES = _AllowlistFiles()
 
-_SEPARATORS = re.compile(r"[,\n]")
+_SEPARATORS = re.compile(r"[,\n\r\t]")
 
 
 def _parse_entry(item: str) -> str | tuple[str, str, int] | None:
@@ -391,14 +392,18 @@ def _parse_entry(item: str) -> str | tuple[str, str, int] | None:
     return scheme, parsed.hostname.lower(), port
 
 
-def _parse_destinations(raw: str) -> tuple[Destinations, int]:
-    """Parse hosts and URLs separated by commas and/or newlines.
+def _parse_destinations(raw: str, *, comments: bool = False) -> tuple[Destinations, int]:
+    """Parse hosts and URLs separated by commas, newlines, carriage returns or tabs.
+
+    With ``comments``, a line whose first non-blank character is ``#`` is ignored whole. Only the file takes comments: a variable has no lines to comment out, and there a ``#`` entry stays an invalid one.
 
     Returns the destinations and how many non-blank entries were skipped as invalid: neither a host nor a URL with a safe scheme, or not parseable at all. A list of nothing valid is an empty allowlist, not an absent one.
     """
     hosts: set[str] = set()
     origins: set[tuple[str, str, int]] = set()
     skipped = 0
+    if comments:
+        raw = "\n".join(line for line in raw.splitlines() if not line.lstrip().startswith("#"))
     for item in _SEPARATORS.split(raw):
         item = item.strip()
         if not item:
