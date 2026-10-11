@@ -31,6 +31,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from types import FrameType
 
+from headroom.proxy.private_paths import foreign_write_access
+
 #: Owner read and write. Connecting to a unix socket needs write permission on it, so this admits only the proxy's own user.
 SOCKET_MODE = stat.S_IRUSR | stat.S_IWUSR
 
@@ -126,16 +128,16 @@ def _require_safe_parent(parent: str, socket_path: str) -> None:
         raise UnixSocketUnusableError(
             f"{parent} holds the socket {socket_path} but is not a directory"
         )
-    if info.st_uid != os.geteuid():
-        raise UnixSocketUnusableError(
-            f"directory {parent} is owned by uid {info.st_uid}, not by the user running the proxy "
-            f"(uid {os.geteuid()}); another owner could replace the socket"
-        )
-    if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-        raise UnixSocketUnusableError(
-            f"directory {parent} is writable by group or others (mode {stat.S_IMODE(info.st_mode):04o}); "
+    problem = foreign_write_access(info)
+    if problem is None:
+        return
+    if problem.other_owner:
+        consequence = "another owner could replace the socket"
+    else:
+        consequence = (
             "they could replace the socket. Run chmod go-w on it or use a private directory"
         )
+    raise UnixSocketUnusableError(f"directory {parent} is {problem.description}; {consequence}")
 
 
 def checked_unix_socket_path(path: str) -> str:
