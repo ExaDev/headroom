@@ -800,6 +800,30 @@ class TestCliOption:
         assert "is a directory" in result.output
         assert seen is None
 
+    @pytest.mark.parametrize(
+        ("args", "env"),
+        [
+            (["--allowed-base-urls-file", ""], {FILE_ENV: None}),
+            (["--allowed-base-urls-file", "   "], {FILE_ENV: None}),
+            ([], {FILE_ENV: "   "}),
+            (["--allowed-base-urls-file", ""], {FILE_ENV: "/somewhere/else"}),
+        ],
+        ids=["blank-option", "spaces-option", "spaces-env", "blank-option-overrides-env"],
+    )
+    def test_a_blank_value_means_no_file(self, args: list[str], env: dict[str, str | None]) -> None:
+        result, seen = self._invoke(args, env)
+
+        assert result.exit_code == 0, result.output
+        assert seen is None
+
+    def test_a_home_relative_path_is_expanded(self, tmp_path: Path) -> None:
+        result, seen = self._invoke(
+            ["--allowed-base-urls-file", "~/allowed"], {FILE_ENV: None, "HOME": str(tmp_path)}
+        )
+
+        assert result.exit_code == 0, result.output
+        assert seen == str(tmp_path / "allowed")
+
     def test_the_option_is_in_the_help(self) -> None:
         result = CliRunner().invoke(main, ["proxy", "--help"])
 
