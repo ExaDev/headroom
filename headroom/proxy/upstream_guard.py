@@ -10,13 +10,14 @@ Policy:
     or otherwise non-public addresses. Public hosts (api.openai.com, api.x.ai,
     Azure, ...) are allowed so ordinary BYOK keeps working.
   * When ``HEADROOM_ALLOWED_BASE_URLS`` is set (hosts or URLs separated by
-    commas and/or newlines), bare hosts permit every safe scheme/port for that
+    commas, newlines, carriage returns or tabs), bare hosts permit every safe scheme/port for that
     host, while URLs permit only their exact normalized origin. A bare host
     with a port (``127.0.0.1:4100``) is neither and is skipped as invalid.
     Because that is an explicit operator choice, allowlisted destinations may
     point at internal/on-prem endpoints.
-  * ``HEADROOM_ALLOWED_BASE_URLS_FILE`` names a file holding more entries in the
-    same format, merged with the variable's. The variable is fixed for the
+  * ``HEADROOM_ALLOWED_BASE_URLS_FILE`` (or ``headroom proxy
+    --allowed-base-urls-file``) names a file holding more entries in the same
+    format, plus ``#`` comment lines and an optional byte-order mark, merged with the variable's. The variable is fixed for the
     life of the process; the file is re-read whenever it changes, so a
     supervisor whose own listed endpoint moves (a loopback port chosen at
     start-up, say) can rewrite the file instead of restarting a proxy that
@@ -38,8 +39,8 @@ falls back to the public-host default, whatever state the file is in:
     only separators already produces. A supervisor that truncates the file
     before it knows its endpoints therefore gets a proxy that refuses every
     caller-supplied upstream, not one that briefly admits every public host.
-  * missing or unreadable (permissions, a directory, not UTF-8): the same as
-    empty, logged at warning level once per distinct failure rather than on
+  * missing or unusable (permissions, not UTF-8, not a regular file, larger
+    than ``_MAX_ALLOWLIST_FILE_BYTES``): the same as empty, logged at warning level once per distinct failure rather than on
     every request, and logged again if it recurs after the file was read.
   * the file variable set to blank: as if unset, mirroring how a blank
     ``HEADROOM_ALLOWED_BASE_URLS`` is treated.
