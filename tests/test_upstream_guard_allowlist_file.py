@@ -530,6 +530,76 @@ def test_concurrent_checks_after_a_change_read_and_log_it_once(
     assert len([r for r in caplog.records if "loaded" in r.getMessage()]) == 1
 
 
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "http://gw.example:8080 # prod",
+        "http://gw.example:8080/ # prod",
+        "http://gw.example:8080\t#prod",
+    ],
+)
+def test_an_inline_comment_in_the_file_ends_the_entry(allow_file: Path, entry: str) -> None:
+    _replace(allow_file, entry + "\n")
+
+    assert is_safe_upstream_url("http://gw.example:8080/v1") is True
+
+
+def test_a_comment_runs_to_the_end_of_its_line_only(allow_file: Path) -> None:
+    allow_file.write_bytes(b"# first, http://127.0.0.1:4200\rhttp://127.0.0.1:4100 # a, b\n")
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+    assert is_safe_upstream_url("http://127.0.0.1:4200/v1") is False
+
+
+def test_a_hash_after_a_comma_is_an_entry_not_a_comment(
+    allow_file: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="headroom.proxy.upstream_guard")
+    _replace(allow_file, "http://127.0.0.1:4100,#http://127.0.0.1:4200\n")
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+    assert is_safe_upstream_url("http://127.0.0.1:4200/v1") is False
+    assert any("1 invalid entry skipped" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    "entry", ["gw.example # prod", "a.example b.example", "http://gw.example:8080 # prod"]
+)
+def test_whitespace_inside_a_variable_entry_makes_it_invalid(
+    monkeypatch: pytest.MonkeyPatch, entry: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger="headroom.proxy.upstream_guard")
+    monkeypatch.setenv(LIST_ENV, f"{entry},gateway.internal")
+
+    assert is_safe_upstream_url("https://gateway.internal/v1") is True
+    assert is_safe_upstream_url("https://gw.example/v1") is False
+    assert is_safe_upstream_url("http://gw.example:8080/v1") is False
+    assert [r.getMessage() for r in caplog.records] == [f"{LIST_ENV}: skipped 1 invalid entry"]
+
+
+def test_whitespace_inside_a_file_entry_makes_it_invalid(
+    allow_file: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="headroom.proxy.upstream_guard")
+    _replace(allow_file, "a.example b.example\nhttp://127.0.0.1:4100\n")
+
+    assert is_safe_upstream_url("https://a.example/v1") is False
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+    assert any("1 invalid entry skipped" in r.getMessage() for r in caplog.records)
+
+
+def test_only_newline_and_carriage_return_end_a_comment(allow_file: Path) -> None:
+    """``str.splitlines`` would also end a comment at U+2028, U+2029 or NEL."""
+    _replace(
+        allow_file,
+        "# note\u2028http://127.0.0.1:4200\x85http://127.0.0.1:4300\nhttp://127.0.0.1:4100\n",
+    )
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+    assert is_safe_upstream_url("http://127.0.0.1:4200/v1") is False
+    assert is_safe_upstream_url("http://127.0.0.1:4300/v1") is False
+
+
 def test_a_blank_file_variable_is_treated_as_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(FILE_ENV, "  ")
 
