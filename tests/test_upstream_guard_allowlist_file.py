@@ -39,9 +39,9 @@ def _count_reads(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     reads: list[str] = []
     real_read = upstream_guard._read_allowlist_file
 
-    def counting_read(path: str):  # noqa: ANN202
+    def counting_read(path: str, st: os.stat_result):  # noqa: ANN202
         reads.append(path)
-        return real_read(path)
+        return real_read(path, st)
 
     monkeypatch.setattr(upstream_guard, "_read_allowlist_file", counting_read)
     return reads
@@ -365,9 +365,9 @@ def test_the_identity_cached_is_the_one_read_not_the_one_first_stat_ed(
     _replace(allow_file, "http://127.0.0.1:4100")
     real_read = upstream_guard._read_allowlist_file
 
-    def replaced_after_stat(path: str):  # noqa: ANN202
+    def replaced_after_stat(path: str, st: os.stat_result):  # noqa: ANN202
         _replace(allow_file, "http://127.0.0.1:4200")
-        return real_read(path)
+        return real_read(path, st)
 
     monkeypatch.setattr(upstream_guard, "_read_allowlist_file", replaced_after_stat)
     assert is_safe_upstream_url("http://127.0.0.1:4200/v1") is True
@@ -375,6 +375,159 @@ def test_the_identity_cached_is_the_one_read_not_the_one_first_stat_ed(
     reads = _count_reads(monkeypatch)
     assert is_safe_upstream_url("http://127.0.0.1:4200/v1") is True
     assert reads == []
+
+
+def _break_oversized(path: Path) -> None:
+    path.write_text("\n" * (upstream_guard._MAX_ALLOWLIST_FILE_BYTES + 1), encoding="utf-8")
+
+
+def _break_not_utf8(path: Path) -> None:
+    path.write_bytes(b"http://127.0.0.1:4100\xff")
+
+
+def _break_unreadable(path: Path) -> None:
+    _replace(path, "http://127.0.0.1:4100")
+    path.chmod(0)
+
+
+def _break_fifo(path: Path) -> None:
+    os.mkfifo(path)
+
+
+def _break_directory(path: Path) -> None:
+    path.mkdir()
+
+
+def _remove(path: Path) -> None:
+    if path.is_dir():
+        path.rmdir()
+    else:
+        path.chmod(0o600)
+        path.unlink()
+
+
+@pytest.mark.parametrize(
+    ("break_file", "opens_expected"),
+    [
+        pytest.param(_break_oversized, 1, id="oversized"),
+        pytest.param(_break_not_utf8, 1, id="not-utf8"),
+        pytest.param(
+            _break_unreadable,
+            1,
+            id="unreadable",
+            marks=pytest.mark.skipif(
+                not hasattr(os, "geteuid") or os.geteuid() == 0,
+                reason="needs POSIX permissions that bind the current user",
+            ),
+        ),
+        pytest.param(
+            _break_fifo,
+            0,
+            id="fifo",
+            marks=pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs FIFOs"),
+        ),
+        pytest.param(_break_directory, 0, id="directory"),
+    ],
+)
+def test_an_unusable_file_is_tried_once_per_version_and_a_repair_is_picked_up(
+    allow_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    break_file: object,
+    opens_expected: int,
+) -> None:
+    """A broken file costs a ``stat`` per check, not an open and a read on every request."""
+    assert callable(break_file)
+    break_file(allow_file)
+    reads = _count_reads(monkeypatch)
+    opens: list[str] = []
+    real_open = os.open
+
+    def counting_open(path: str, *args: object, **kwargs: object) -> int:
+        if os.fspath(path) == str(allow_file):
+            opens.append(os.fspath(path))
+        return real_open(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", counting_open)
+
+    for _ in range(5):
+        assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+    assert len(reads) == 1
+    assert len(opens) == opens_expected
+
+    _remove(allow_file)
+    _replace(allow_file, "http://127.0.0.1:4100")
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+    assert len(reads) == 2
+
+
+def test_an_oversized_file_is_refused_from_its_size_before_any_read(
+    allow_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _break_oversized(allow_file)
+    read_sizes: list[int] = []
+    real_fdopen = os.fdopen
+
+    class _RecordingHandle:
+        def __init__(self, handle: object) -> None:
+            self._handle = handle
+
+        def __enter__(self) -> _RecordingHandle:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            self._handle.close()  # type: ignore[attr-defined]
+
+        def fileno(self) -> int:
+            return int(self._handle.fileno())  # type: ignore[attr-defined]
+
+        def read(self, size: int = -1) -> bytes:
+            read_sizes.append(size)
+            return bytes(self._handle.read(size))  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(
+        os, "fdopen", lambda fd, *a, **k: _RecordingHandle(real_fdopen(fd, *a, **k))
+    )
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+    assert read_sizes == []
+
+
+def test_concurrent_checks_after_a_change_read_and_log_it_once(
+    allow_file: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="headroom.proxy.upstream_guard")
+    _replace(allow_file, "http://127.0.0.1:4100")
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+    _replace(allow_file, "http://127.0.0.1:4200")
+    caplog.clear()
+
+    threads_count = 8
+    arrived = threading.Barrier(threads_count)
+    reads: list[str] = []
+    real_read = upstream_guard._read_allowlist_file
+
+    def slow_read(path: str, st: os.stat_result):  # noqa: ANN202
+        reads.append(path)
+        # Hold the reload long enough for every other check to stat the changed file and queue.
+        threading.Event().wait(0.2)
+        return real_read(path, st)
+
+    monkeypatch.setattr(upstream_guard, "_read_allowlist_file", slow_read)
+    results: list[bool] = []
+
+    def check() -> None:
+        arrived.wait(timeout=5)
+        results.append(is_safe_upstream_url("http://127.0.0.1:4200/v1"))
+
+    workers = [threading.Thread(target=check) for _ in range(threads_count)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=10)
+
+    assert results == [True] * threads_count
+    assert len(reads) == 1
+    assert len([r for r in caplog.records if "loaded" in r.getMessage()]) == 1
 
 
 def test_a_blank_file_variable_is_treated_as_unset(monkeypatch: pytest.MonkeyPatch) -> None:

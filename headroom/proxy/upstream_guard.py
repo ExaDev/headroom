@@ -270,69 +270,109 @@ class _FileIdentity:
 # The longest entry worth listing is a URL origin: "https://", a 253-character DNS name (or a bracketed IPv6 literal, shorter), ":65535" and a separator, about 270 bytes. One MiB holds several thousand of those, orders of magnitude beyond any operator's allowlist, while bounding the memory and parse work one reload can cost. A file past it is a wrong path (a log, a binary) rather than a list, and it is refused whole: reading only a prefix could turn it into a different, valid-looking list.
 _MAX_ALLOWLIST_FILE_BYTES = 1 << 20
 
-# `os.open` flag that keeps a FIFO at the path from blocking the open until a writer appears. Windows has neither FIFOs nor the flag.
+# `os.open` flags: O_NONBLOCK keeps a FIFO that appears at the path between the `stat` and the open from blocking the open until a writer arrives, and O_NOCTTY keeps a terminal that appears there from becoming the process's controlling terminal. Windows has neither flag, nor FIFOs or controlling terminals.
 _O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+_O_NOCTTY = getattr(os, "O_NOCTTY", 0)
 
 
 class _UnusableAllowlistFile(Exception):
-    """The path opened, but what it names must not be read as an allowlist."""
+    """The file at the path cannot be used as an allowlist, and which version of it that was."""
+
+    def __init__(self, reason: str, identity: _FileIdentity) -> None:
+        super().__init__(reason)
+        self.identity = identity
 
 
-def _read_allowlist_file(path: str) -> tuple[_FileIdentity, bytes]:
-    """Return the identity of the file read and its bytes.
+def _read_allowlist_file(path: str, st: os.stat_result) -> tuple[_FileIdentity, str]:
+    """Return the identity of the file read and its text; ``st`` is the caller's ``stat`` of it.
 
-    Raises ``OSError`` when it cannot be opened or read, and :class:`_UnusableAllowlistFile` when it is not a regular file (a FIFO would block the read until a writer appeared, a device could stream without end) or is larger than ``_MAX_ALLOWLIST_FILE_BYTES``.
+    Raises :class:`_UnusableAllowlistFile` when it is not a regular file, cannot be opened or read, is larger than ``_MAX_ALLOWLIST_FILE_BYTES`` or is not UTF-8. The type is checked on ``st`` before anything is opened, so a device or terminal named by mistake is never opened, and again on the descriptor, for one swapped in after the ``stat``. The size is checked on the descriptor before anything is read.
     """
-    fd = os.open(path, os.O_RDONLY | _O_NONBLOCK)
+    identity = _FileIdentity.of(st)
+    if not stat.S_ISREG(st.st_mode):
+        raise _UnusableAllowlistFile("not a regular file", identity)
+    try:
+        fd = os.open(path, os.O_RDONLY | _O_NONBLOCK | _O_NOCTTY)
+    except OSError as exc:
+        raise _UnusableAllowlistFile(str(exc), identity) from exc
     with os.fdopen(fd, "rb") as handle:
         st = os.fstat(handle.fileno())
+        # The identity recorded is the descriptor's, not the caller's `stat`'s. A rename between the two means the bytes read are the newer file's; filed under the older identity, the next check would see a mismatch and read the file again for nothing.
+        identity = _FileIdentity.of(st)
         if not stat.S_ISREG(st.st_mode):
-            raise _UnusableAllowlistFile("not a regular file")
-        # One byte past the cap, so a file that grew after the `fstat` is still caught.
-        data = handle.read(_MAX_ALLOWLIST_FILE_BYTES + 1)
+            raise _UnusableAllowlistFile("not a regular file", identity)
+        too_large = _UnusableAllowlistFile(
+            f"larger than {_MAX_ALLOWLIST_FILE_BYTES} bytes", identity
+        )
+        if st.st_size > _MAX_ALLOWLIST_FILE_BYTES:
+            raise too_large
+        try:
+            # One byte past the cap, so a file that grew after the `fstat` is still caught.
+            data = handle.read(_MAX_ALLOWLIST_FILE_BYTES + 1)
+        except OSError as exc:
+            raise _UnusableAllowlistFile(str(exc), identity) from exc
     if len(data) > _MAX_ALLOWLIST_FILE_BYTES:
-        raise _UnusableAllowlistFile(f"larger than {_MAX_ALLOWLIST_FILE_BYTES} bytes")
-    return _FileIdentity.of(st), data
+        raise too_large
+    try:
+        # utf-8-sig drops the byte-order mark some editors write; without it, the mark would join the first entry and make it invalid.
+        return identity, data.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise _UnusableAllowlistFile(f"not UTF-8 ({exc})", identity) from exc
 
 
 class _AllowlistFiles:
-    """Parsed allowlist files, re-read only when a file's identity changes.
+    """What each allowlist file held, re-read only when the file's identity changes.
 
-    Thread-safe: the event loop and the resolver pool both reach the guard. The lock covers only the bookkeeping, never the ``stat`` or the read, so a slow filesystem cannot serialise every check behind one reader. Two threads that both see a change may both read the file; each records what it read against the identity of the descriptor it read from, so whichever lands last is still a consistent pair.
+    A version that could not be used is cached too, as ``None``, so a file that is oversized, not UTF-8 or unreadable costs one ``stat`` per check like a good one, not an open and a read on every request.
+
+    Thread-safe: the event loop and the resolver pool both reach the guard. Checks against an unchanged file take only the bookkeeping lock. Checks that see a change queue on one reload lock and re-check the cache once they hold it, so a change is read and logged once however many requests arrive together; the wait is bounded by one read of at most ``_MAX_ALLOWLIST_FILE_BYTES``.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._loaded: dict[str, tuple[_FileIdentity, Destinations]] = {}
-        self._reported: dict[str, tuple[str, str]] = {}
+        self._reload_lock = threading.Lock()
+        self._loaded: dict[str, tuple[_FileIdentity, Destinations | None]] = {}
+        self._reported: dict[str, str] = {}
+
+    def _cached(self, path: str, identity: _FileIdentity) -> tuple[bool, Destinations | None]:
+        """``(True, what that version held)`` if ``identity`` is the version cached, else ``(False, None)``."""
+        with self._lock:
+            cached = self._loaded.get(path)
+        if cached is not None and cached[0] == identity:
+            return True, cached[1]
+        return False, None
 
     def load(self, path: str, file_env: str, env: str) -> Destinations | None:
-        """Return ``path``'s entries, or ``None`` when it cannot be read.
+        """Return ``path``'s entries, or ``None`` when it cannot be used.
 
         ``file_env`` names the variable that pointed here and ``env`` the list
         its entries are merged with; both are for the log lines only.
         """
         try:
-            identity = _FileIdentity.of(os.stat(path))
+            st = os.stat(path)
         except OSError as exc:
-            self._report(path, exc, file_env, env)
+            self._report(path, str(exc), file_env, env)
             return None
-        with self._lock:
-            cached = self._loaded.get(path)
-        if cached is not None and cached[0] == identity:
-            return cached[1]
-        try:
-            # The identity recorded is the descriptor's, not the earlier `stat`'s. A rename between the two means the bytes read are the newer file's; filed under the older identity, the next check would see a mismatch and read the file again for nothing.
-            identity, data = _read_allowlist_file(path)
-            # utf-8-sig drops the byte-order mark some editors write; without it, the mark would join the first entry and make it invalid.
-            raw = data.decode("utf-8-sig")
-        except (OSError, UnicodeDecodeError, _UnusableAllowlistFile) as exc:
-            self._report(path, exc, file_env, env)
-            return None
-        entries, skipped = _parse_destinations(raw, comments=True)
-        with self._lock:
-            self._loaded[path] = (identity, entries)
-            recovered = self._reported.pop(path, None) is not None
+        identity = _FileIdentity.of(st)
+        hit, entries = self._cached(path, identity)
+        if hit:
+            return entries
+        with self._reload_lock:
+            # Another check may have read this very version while this one queued.
+            hit, entries = self._cached(path, identity)
+            if hit:
+                return entries
+            try:
+                identity, raw = _read_allowlist_file(path, st)
+            except _UnusableAllowlistFile as exc:
+                with self._lock:
+                    self._loaded[path] = (exc.identity, None)
+                self._report(path, str(exc), file_env, env)
+                return None
+            entries, skipped = _parse_destinations(raw, comments=True)
+            with self._lock:
+                self._loaded[path] = (identity, entries)
+                recovered = self._reported.pop(path, None) is not None
         logger.log(
             logging.WARNING if skipped else logging.INFO,
             "%s: %s %s, %d host(s) and %d origin(s), %d invalid entr%s skipped",
@@ -346,23 +386,19 @@ class _AllowlistFiles:
         )
         return entries
 
-    def _report(self, path: str, exc: Exception, file_env: str, env: str) -> None:
-        """Log a failure once, until it changes or the file is read again.
-
-        The last good entries stay cached and are not served while the failure lasts, since :meth:`load` returns ``None``. They are served again only if a later ``stat`` matches their identity exactly, and an identity that includes the status-change time matches only the same version of the same file: one whose entries they still are.
-        """
-        failure = (type(exc).__name__, str(exc))
+    def _report(self, path: str, reason: str, file_env: str, env: str) -> None:
+        """Log a failure once, until it changes or the file is read again."""
         with self._lock:
-            if self._reported.get(path) == failure:
+            if self._reported.get(path) == reason:
                 return
-            self._reported[path] = failure
+            self._reported[path] = reason
         logger.warning(
             "%s: cannot read %s (%s). Until it can be read, only the entries in "
             "%s are allowlisted (none when it is unset) and every other "
             "x-headroom-base-url is rejected with 400.",
             file_env,
             path,
-            exc,
+            reason,
             env,
         )
 
