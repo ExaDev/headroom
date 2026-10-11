@@ -788,6 +788,47 @@ def test_a_cached_version_is_withheld_while_its_directory_is_unsafe(
     assert any(m.endswith("is usable again") for m in messages)
 
 
+def test_the_file_is_opened_in_binary_mode_where_the_platform_has_one(
+    allow_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On Windows a text-mode descriptor stops at a 0x1A byte; the flag is what prevents it."""
+    fake_o_binary = 1 << 30
+    monkeypatch.setattr(upstream_guard, "_O_BINARY", fake_o_binary)
+    _replace(allow_file, "http://127.0.0.1:4100")
+    real_open = os.open
+    flags_seen: list[int] = []
+
+    def recording_open(path: str, flags: int, *args: object, **kwargs: object) -> int:
+        if os.fspath(path) == str(allow_file):
+            flags_seen.append(flags)
+            flags &= ~fake_o_binary
+        return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", recording_open)
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+    assert len(flags_seen) == 1
+    assert flags_seen[0] & fake_o_binary
+
+
+def test_without_geteuid_ownership_is_not_judged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows has no os.geteuid and no POSIX modes; the file is still read and used."""
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    allow_file = shared / "allowed"
+    _replace(allow_file, "http://127.0.0.1:4100")
+    monkeypatch.setenv(FILE_ENV, str(allow_file))
+    monkeypatch.delattr(os, "geteuid", raising=False)
+    allow_file.chmod(0o666)
+    shared.chmod(0o777)
+    try:
+        assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+    finally:
+        shared.chmod(0o700)
+
+
 def test_concurrent_checks_after_a_change_read_and_log_it_once(
     allow_file: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

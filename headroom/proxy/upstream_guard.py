@@ -286,6 +286,8 @@ _MAX_ALLOWLIST_FILE_BYTES = 1 << 20
 # `os.open` flags: O_NONBLOCK keeps a FIFO that appears at the path between the `stat` and the open from blocking the open until a writer arrives, and O_NOCTTY keeps a terminal that appears there from becoming the process's controlling terminal. Windows has neither flag, nor FIFOs or controlling terminals.
 _O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 _O_NOCTTY = getattr(os, "O_NOCTTY", 0)
+# Windows only: without O_BINARY a descriptor opened by `os.open` is in text mode, where a 0x1A byte (Ctrl-Z) ends the read early. POSIX has no text mode and no flag.
+_O_BINARY = getattr(os, "O_BINARY", 0)
 
 
 # Errors that describe the file at the path, or the path itself, rather than the state of this process or the machine at the moment of the read. Only these are remembered against a file version: retrying the same version would meet them again. Everything else (EMFILE, ENFILE, ENOMEM, EIO, EINTR, ...) can clear without the file changing, so it is retried on the next check.
@@ -389,7 +391,7 @@ def _read_allowlist_file(path: str, st: os.stat_result) -> tuple[_FileIdentity, 
         raise _UnusableAllowlistFile("not a regular file", identity)
     _require_private_file(st, identity)
     try:
-        fd = os.open(path, os.O_RDONLY | _O_NONBLOCK | _O_NOCTTY)
+        fd = os.open(path, os.O_RDONLY | _O_NONBLOCK | _O_NOCTTY | _O_BINARY)
     except OSError as exc:
         raise _UnusableAllowlistFile.from_os_error(exc, identity) from exc
     with os.fdopen(fd, "rb") as handle:
