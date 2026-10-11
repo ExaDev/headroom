@@ -1017,7 +1017,37 @@ class TestCliOption:
         result, seen = self._invoke(args, env)
 
         assert result.exit_code == 0, result.output
-        assert seen is None
+        assert seen == ""
+
+    @pytest.mark.parametrize("factory", ["create_app", "create_app_from_env"])
+    def test_a_blank_option_overrides_a_stored_setting_through_the_app_factory(
+        self, tmp_path: Path, factory: str
+    ) -> None:
+        """create_app re-applies stored settings with setdefault; the blank must survive that."""
+        from headroom import settings_store
+        from headroom.proxy import server
+
+        settings_store.save({"allowed_base_urls_file": str(tmp_path / "stored")})
+        seen: dict[str, str | None] = {}
+
+        def run_server_through_the_factory(config: ProxyConfig, **kwargs: object) -> None:
+            if factory == "create_app":
+                server.create_app(config)
+            else:
+                server.create_app_from_env()
+            seen["file"] = os.environ.get(FILE_ENV)
+            seen["allows_public"] = str(is_safe_upstream_url("https://8.8.8.8/v1"))
+
+        with patch("headroom.proxy.server.run_server", run_server_through_the_factory):
+            result = CliRunner().invoke(
+                main,
+                ["proxy", "--port", str(_free_port()), "--allowed-base-urls-file", ""],
+                env={"HEADROOM_HOST": None, "HEADROOM_PORT": None, FILE_ENV: None},
+            )
+
+        assert result.exit_code == 0, result.output
+        assert seen["file"] == ""
+        assert seen["allows_public"] == "True"
 
     def test_a_home_relative_path_is_expanded(self, tmp_path: Path) -> None:
         upstream_guard.resolve_allowlist_file_path.cache_clear()
