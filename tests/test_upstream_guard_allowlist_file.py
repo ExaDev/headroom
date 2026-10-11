@@ -202,6 +202,44 @@ def test_revoking_read_permission_on_a_cached_file_takes_effect(
     assert "Permission denied" in warnings[0].getMessage()
 
 
+_MALFORMED = pytest.mark.parametrize(
+    "bad",
+    [
+        "[oops",  # unbalanced IPv6 bracket, bare
+        "http://[::1",  # unbalanced IPv6 bracket in a URL
+        "http://a℀b.example",  # NFKC turns U+2100 into "a/c", URL syntax in the netloc
+        "a℀b.example",  # the same, bare
+    ],
+)
+
+
+@_MALFORMED
+def test_a_malformed_file_entry_is_skipped_not_fatal(
+    allow_file: Path, bad: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="headroom.proxy.upstream_guard")
+    _replace(allow_file, f"{bad}\nhttp://127.0.0.1:4100\n")
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+    assert is_safe_upstream_url("https://8.8.8.8/v1") is False
+    loads = [r.getMessage() for r in caplog.records if "loaded" in r.getMessage()]
+    assert len(loads) == 1
+    assert "1 invalid entry skipped" in loads[0]
+
+
+@_MALFORMED
+def test_a_malformed_variable_entry_is_skipped_not_fatal(
+    monkeypatch: pytest.MonkeyPatch, bad: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger="headroom.proxy.upstream_guard")
+    monkeypatch.setenv(LIST_ENV, f"{bad},gateway.internal")
+
+    for _ in range(3):
+        assert is_safe_upstream_url("https://gateway.internal/v1") is True
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings == [f"{LIST_ENV}: skipped 1 invalid entry"]
+
+
 def test_a_blank_file_variable_is_treated_as_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(FILE_ENV, "  ")
 

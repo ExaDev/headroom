@@ -298,17 +298,20 @@ class _AllowlistFiles:
         except (OSError, UnicodeDecodeError) as exc:
             self._report(path, exc, file_env, env)
             return None
-        entries = _parse_destinations(raw)
+        entries, skipped = _parse_destinations(raw)
         with self._lock:
             self._loaded[path] = (identity, entries)
             recovered = self._reported.pop(path, None) is not None
-        logger.info(
-            "%s: %s %s, %d host(s) and %d origin(s)",
+        logger.log(
+            logging.WARNING if skipped else logging.INFO,
+            "%s: %s %s, %d host(s) and %d origin(s), %d invalid entr%s skipped",
             file_env,
             "read again after failing:" if recovered else "loaded",
             path,
             len(entries[0]),
             len(entries[1]),
+            skipped,
+            "y" if skipped == 1 else "ies",
         )
         return entries
 
@@ -337,33 +340,66 @@ _ALLOWLIST_FILES = _AllowlistFiles()
 _SEPARATORS = re.compile(r"[,\n]")
 
 
-def _parse_destinations(raw: str) -> Destinations:
+def _parse_entry(item: str) -> str | tuple[str, str, int] | None:
+    """Return a bare host, an exact ``(scheme, host, port)`` origin, or ``None`` for neither."""
+    try:
+        if "://" not in item:
+            hostname = urlparse(f"//{item}").hostname
+            return hostname.lower() if hostname else None
+        parsed = urlparse(item)
+        scheme = parsed.scheme.lower()
+        if scheme not in _SAFE_SCHEMES or not parsed.hostname:
+            return None
+        port = parsed.port
+    except ValueError:
+        # `urlparse` raises for an unbalanced IPv6 bracket ("[oops", "http://[::1") and for a netloc that NFKC normalisation would turn into URL syntax; `.port` raises for a non-numeric or out-of-range port. Each is one bad entry, skipped like any other, rather than an exception that takes every other entry, and every request, down with it.
+        return None
+    if port is None:
+        port = 443 if scheme in {"https", "wss"} else 80
+    return scheme, parsed.hostname.lower(), port
+
+
+def _parse_destinations(raw: str) -> tuple[Destinations, int]:
     """Parse hosts and URLs separated by commas and/or newlines.
 
-    Entries that are neither a host nor a URL with a safe scheme are skipped, so a list of nothing valid is an empty allowlist, not an absent one.
+    Returns the destinations and how many non-blank entries were skipped as invalid: neither a host nor a URL with a safe scheme, or not parseable at all. A list of nothing valid is an empty allowlist, not an absent one.
     """
     hosts: set[str] = set()
     origins: set[tuple[str, str, int]] = set()
+    skipped = 0
     for item in _SEPARATORS.split(raw):
         item = item.strip()
         if not item:
             continue
-        if "://" not in item:
-            parsed = urlparse(f"//{item}")
-            if parsed.hostname:
-                hosts.add(parsed.hostname.lower())
-            continue
-        parsed = urlparse(item)
-        if parsed.scheme.lower() not in _SAFE_SCHEMES or not parsed.hostname:
-            continue
-        try:
-            port = parsed.port
-        except ValueError:
-            continue
-        if port is None:
-            port = 443 if parsed.scheme.lower() in {"https", "wss"} else 80
-        origins.add((parsed.scheme.lower(), parsed.hostname.lower(), port))
-    return frozenset(hosts), frozenset(origins)
+        entry = _parse_entry(item)
+        if entry is None:
+            skipped += 1
+        elif isinstance(entry, str):
+            hosts.add(entry)
+        else:
+            origins.add(entry)
+    return (frozenset(hosts), frozenset(origins)), skipped
+
+
+_SKIPPED_IN_VARIABLE: dict[str, str] = {}
+_SKIPPED_IN_VARIABLE_LOCK = threading.Lock()
+
+
+def _parse_variable(env: str, raw: str) -> Destinations:
+    """Parse ``env``'s value, warning once per distinct value that holds invalid entries.
+
+    The variable is parsed on every check, so the warning is keyed on the value rather than logged per request.
+    """
+    destinations, skipped = _parse_destinations(raw)
+    if skipped:
+        with _SKIPPED_IN_VARIABLE_LOCK:
+            already = _SKIPPED_IN_VARIABLE.get(env) == raw
+            _SKIPPED_IN_VARIABLE[env] = raw
+        if not already:
+            logger.warning(
+                "%s: skipped %d invalid entr%s", env, skipped, "y" if skipped == 1 else "ies"
+            )
+    return destinations
 
 
 def allowlisted_destinations(
@@ -375,7 +411,7 @@ def allowlisted_destinations(
     ``None`` means no allowlist at all: neither variable is set (or each is blank), and the caller applies its default policy. Anything else is allowlist mode, possibly with nothing listed. Once ``file_env`` names a file the result is never ``None``, even when the file is empty, missing or unreadable; see the module docstring for why. Pass ``file_env=None`` for a list that has no file form.
     """
     raw = os.environ.get(env)
-    listed = _parse_destinations(raw) if raw and raw.strip() else None
+    listed = _parse_variable(env, raw) if raw and raw.strip() else None
     if file_env is None:
         return listed
     path = (os.environ.get(file_env) or "").strip()
