@@ -725,6 +725,21 @@ SETTINGS: tuple[SettingField, ...] = (
         help="JSON object of extra headers merged into (and overriding) forwarded OpenAI requests.",
         tier="advanced",
     ),
+    SettingField(
+        "HEADROOM_ALLOWED_BASE_URLS_FILE",
+        "allowed_base_urls_file",
+        "Upstream allowlist file",
+        "Endpoints",
+        "str",
+        default=None,
+        help=(
+            "File of hosts and URLs that x-headroom-base-url may name, merged with "
+            "HEADROOM_ALLOWED_BASE_URLS. Setting it means allowlist mode, even while the "
+            "file is empty or missing. The path is read at startup; the file's contents "
+            "are re-read whenever it changes, with no restart."
+        ),
+        tier="advanced",
+    ),
 )
 
 _BY_KEY: dict[str, SettingField] = {f.key: f for f in SETTINGS}
