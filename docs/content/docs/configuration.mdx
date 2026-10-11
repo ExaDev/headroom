@@ -197,6 +197,8 @@ reachable via `x-headroom-base-url` through an outbound proxy, name it in
 `HEADROOM_ALLOWED_BASE_URLS` — an explicit operator decision to admit that
 destination by name, which also turns off the resolve-and-pin check for it.
 
+Entries are hosts (any port) or URLs (that exact origin), separated by commas and/or newlines. The variable is fixed for the life of the proxy process. When an allowed endpoint can move (a supervisor that lists its own loopback port, for example), put the entries in a file and name it in `HEADROOM_ALLOWED_BASE_URLS_FILE` instead, or as well: its entries are merged with the variable's, and the proxy re-reads the file on the next request after it changes, with no restart. Replace it atomically (write a sibling file, then rename it over the original). Naming a file always means allowlist mode: if it is empty, missing or unreadable, only the variable's entries are admitted (none when the variable is unset), every other `x-headroom-base-url` is rejected with 400, and the proxy logs a warning naming the file and the error once per distinct failure.
+
 ## SmartCrusher Configuration
 
 Fine-tune JSON compression behavior:
