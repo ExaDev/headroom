@@ -407,9 +407,15 @@ _ALLOWLIST_FILES = _AllowlistFiles()
 
 _SEPARATORS = re.compile(r"[,\n\r\t]")
 
+# A comment in the file: a "#" at the very start, or after a space, tab, newline or carriage return, through to the end of its line (the next newline or carriage return, the line-ending members of `_SEPARATORS`). A "#" anywhere else is part of an entry, which then fails to parse as one.
+_COMMENT = re.compile(r"(?:^|(?<=[ \t\r\n]))#[^\r\n]*")
+
 
 def _parse_entry(item: str) -> str | tuple[str, str, int] | None:
     """Return a bare host, an exact ``(scheme, host, port)`` origin, or ``None`` for neither."""
+    if any(character.isspace() for character in item):
+        # A host or URL never contains whitespace, so "a.example b.example" or "gw.example # prod" in a variable is one entry that could never match anything. Counted as invalid, it is at least reported.
+        return None
     try:
         if "://" not in item:
             bare = urlparse(f"//{item}")
@@ -433,7 +439,7 @@ def _parse_entry(item: str) -> str | tuple[str, str, int] | None:
 def _parse_destinations(raw: str, *, comments: bool = False) -> tuple[Destinations, int]:
     """Parse hosts and URLs separated by commas, newlines, carriage returns or tabs.
 
-    With ``comments``, a line whose first non-blank character is ``#`` is ignored whole. Only the file takes comments: a variable has no lines to comment out, and there a ``#`` entry stays an invalid one.
+    With ``comments``, a ``#`` at the start of the text or after a space, tab, newline or carriage return begins a comment that runs to the end of its line. Only the file takes comments: a variable has no lines to comment out, and there a ``#`` stays part of an entry, which is then invalid.
 
     Returns the destinations and how many non-blank entries were skipped as invalid: neither a host nor a URL with a safe scheme, or not parseable at all. A list of nothing valid is an empty allowlist, not an absent one.
     """
@@ -441,7 +447,7 @@ def _parse_destinations(raw: str, *, comments: bool = False) -> tuple[Destinatio
     origins: set[tuple[str, str, int]] = set()
     skipped = 0
     if comments:
-        raw = "\n".join(line for line in raw.splitlines() if not line.lstrip().startswith("#"))
+        raw = _COMMENT.sub("", raw)
     for item in _SEPARATORS.split(raw):
         item = item.strip()
         if not item:
