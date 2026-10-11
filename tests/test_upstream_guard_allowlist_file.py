@@ -159,6 +159,49 @@ def test_entries_from_an_earlier_version_are_dropped_when_the_file_breaks(
     assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
 
 
+def test_a_same_size_rewrite_with_its_mtime_restored_is_noticed(allow_file: Path) -> None:
+    """``cp -p``, ``touch -r`` and coarse timestamps all leave mtime and size unchanged."""
+    allow_file.write_text("http://127.0.0.1:4100", encoding="utf-8")
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+    before = allow_file.stat()
+
+    with allow_file.open("r+", encoding="utf-8") as handle:
+        handle.write("http://127.0.0.1:4200")
+    os.utime(allow_file, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = allow_file.stat()
+    assert (after.st_ino, after.st_size, after.st_mtime_ns) == (
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+
+    assert is_safe_upstream_url("http://127.0.0.1:4200/v1") is True
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0,
+    reason="needs POSIX permissions that bind the current user (root reads mode 000 files)",
+)
+def test_revoking_read_permission_on_a_cached_file_takes_effect(
+    allow_file: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger="headroom.proxy.upstream_guard")
+    _replace(allow_file, "http://127.0.0.1:4100")
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+
+    allow_file.chmod(0)
+    try:
+        assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+        assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+    finally:
+        allow_file.chmod(0o600)
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "Permission denied" in warnings[0].getMessage()
+
+
 def test_a_blank_file_variable_is_treated_as_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(FILE_ENV, "  ")
 

@@ -20,9 +20,9 @@ Policy:
     supervisor whose own listed endpoint moves (a loopback port chosen at
     start-up, say) can rewrite the file instead of restarting a proxy that
     sessions are still using. Replace it atomically (write a sibling, then
-    rename over it): a change is detected by the file's identity (inode,
-    modification time and size), and an unchanged file costs one ``stat`` per
-    check, never a read.
+    rename over it): a change is detected by the file's identity (device,
+    inode, size, and modification and status-change times), and an unchanged
+    file costs one ``stat`` per check, never a read.
 
 Naming a file is itself the operator's choice of allowlist mode, so it never
 falls back to the public-host default, whatever state the file is in:
@@ -250,16 +250,18 @@ _NO_DESTINATIONS: Destinations = (frozenset(), frozenset())
 class _FileIdentity:
     """What distinguishes one version of a file from another without reading it.
 
-    A rename-replaced file has a new inode; an in-place rewrite changes the modification time and usually the size. ``st_mtime_ns`` rather than ``st_mtime`` so two writes within one coarse timestamp tick still differ on filesystems that record nanoseconds.
+    A rename-replaced file has a new inode (and, across a mount, a new device). An in-place rewrite changes the modification time, but that time is settable (``cp -p``, ``touch -r``, ``os.utime``) and coarse on some filesystems, so a same-size rewrite can leave it as it was. The status-change time cannot be set by a writer and moves on every write, ``chmod`` and ``utime``, so it catches both that rewrite and a permission change that should stop the file being read. Nanosecond fields, so two changes within one coarse tick still differ where the filesystem records nanoseconds.
     """
 
+    device: int
     inode: int
-    mtime_ns: int
     size: int
+    mtime_ns: int
+    ctime_ns: int
 
     @classmethod
     def of(cls, st: os.stat_result) -> _FileIdentity:
-        return cls(st.st_ino, st.st_mtime_ns, st.st_size)
+        return cls(st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
 class _AllowlistFiles:
