@@ -321,7 +321,7 @@ class _AllowlistFiles:
         if cached is not None and cached[0] == identity:
             return cached[1]
         try:
-            # The identity recorded is the descriptor's, not the earlier `stat`'s: a rename between the two would otherwise file the new contents under the old identity and never reload them.
+            # The identity recorded is the descriptor's, not the earlier `stat`'s. A rename between the two means the bytes read are the newer file's; filed under the older identity, the next check would see a mismatch and read the file again for nothing.
             identity, data = _read_allowlist_file(path)
             # utf-8-sig drops the byte-order mark some editors write; without it, the mark would join the first entry and make it invalid.
             raw = data.decode("utf-8-sig")
@@ -346,11 +346,12 @@ class _AllowlistFiles:
         return entries
 
     def _report(self, path: str, exc: Exception, file_env: str, env: str) -> None:
-        """Log a failure once, until it changes or the file is read again."""
+        """Log a failure once, until it changes or the file is read again.
+
+        The last good entries stay cached and are not served while the failure lasts, since :meth:`load` returns ``None``. They are served again only if a later ``stat`` matches their identity exactly, and an identity that includes the status-change time matches only the same version of the same file: one whose entries they still are.
+        """
         failure = (type(exc).__name__, str(exc))
         with self._lock:
-            # A file that cannot be read must not keep admitting what it used to list, so its last good contents are forgotten, not served.
-            self._loaded.pop(path, None)
             if self._reported.get(path) == failure:
                 return
             self._reported[path] = failure
