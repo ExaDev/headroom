@@ -571,6 +571,68 @@ def test_a_relative_path_keeps_the_directory_of_its_first_use(
     assert is_safe_upstream_url("http://127.0.0.1:4200/v1") is False
 
 
+_POSIX_USER = pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0,
+    reason="needs POSIX ownership and modes that bind the current user",
+)
+
+
+@_POSIX_USER
+def test_a_group_writable_file_is_refused(
+    allow_file: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger="headroom.proxy.upstream_guard")
+    _replace(allow_file, "http://127.0.0.1:4100")
+    allow_file.chmod(0o620)
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+    (warning,) = [r.getMessage() for r in caplog.records]
+    assert "the file is writable by group or others (mode 0620)" in warning
+
+    allow_file.chmod(0o600)
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+
+
+@_POSIX_USER
+def test_a_file_in_a_group_writable_directory_is_refused_until_it_is_fixed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger="headroom.proxy.upstream_guard")
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    allow_file = shared / "allowed"
+    _replace(allow_file, "http://127.0.0.1:4100")
+    monkeypatch.setenv(FILE_ENV, str(allow_file))
+    shared.chmod(0o770)
+    try:
+        assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+        assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+    finally:
+        # Fixing the directory changes nothing about the file, so this proves the failure was not cached against it.
+        shared.chmod(0o700)
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "its directory is writable by group or others (mode 0770)" in warnings[0]
+
+
+@_POSIX_USER
+def test_a_file_owned_by_another_user_is_refused(
+    allow_file: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Ownership cannot be given away without root, so the running user is changed instead."""
+    caplog.set_level(logging.WARNING, logger="headroom.proxy.upstream_guard")
+    _replace(allow_file, "http://127.0.0.1:4100")
+    real_uid = os.geteuid()
+    monkeypatch.setattr(os, "geteuid", lambda: real_uid + 1)
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+    (warning,) = [r.getMessage() for r in caplog.records]
+    assert f"the file is owned by uid {real_uid}" in warning
+
+
 def test_concurrent_checks_after_a_change_read_and_log_it_once(
     allow_file: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
