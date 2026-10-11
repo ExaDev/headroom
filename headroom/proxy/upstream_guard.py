@@ -338,13 +338,13 @@ class _UnusableAllowlistFile(Exception):
 def _require_private(
     path: str, st: os.stat_result, identity: _FileIdentity, *, directory: bool = True
 ) -> None:
-    """Raise :class:`_UnusableAllowlistFile` if a user other than this one could change the file.
+    """Raise :class:`_UnusableAllowlistFile` if a user other than this one or root could change the file.
 
-    The same rule as the ``--uds`` socket's directory (:func:`headroom.proxy.private_paths.foreign_write_access`): another owner, or group or other write permission, on the file itself, or with ``directory``, on the directory that holds the path, whose write permission lets anyone with it replace the file. A permission change on the file moves its status-change time, so that failure is remembered against the file's identity; one on the directory does not, so that failure is retried on every check until it clears. A cached good version is checked again whenever the file changes, which is the only way the directory's write access could reach it. Skipped where there is no ``os.geteuid`` (Windows), which has no POSIX ownership and modes to judge.
+    The ``--uds`` directory rule (:func:`headroom.proxy.private_paths.foreign_write_access`), relaxed for a file that is only read: the file must be owned by this user or root and not writable by group or others; with ``directory``, the directory that holds the path must be owned by this user or root and either not writable by group or others, or sticky, where only an entry's owner can unlink or rename it. Root is trusted because it can change anything anyway, which is what lets root-owned bind mounts and ConfigMap volumes work for a proxy running as another user. A permission change on the file moves its status-change time, so that failure is remembered against the file's identity; one on the directory does not, so that failure is retried on every check until it clears. A cached good version is checked again whenever the file changes, which is the only way the directory's write access could reach it. Skipped where there is no ``os.geteuid`` (Windows), which has no POSIX ownership and modes to judge.
     """
     if not hasattr(os, "geteuid"):
         return
-    problem = foreign_write_access(st)
+    problem = foreign_write_access(st, root_may_own=True)
     if problem is not None:
         raise _UnusableAllowlistFile(f"the file is {problem.description}", identity)
     if not directory:
@@ -354,7 +354,8 @@ def _require_private(
         parent_st = os.stat(parent)
     except OSError as exc:
         raise _UnusableAllowlistFile.from_os_error(exc, identity) from exc
-    problem = foreign_write_access(parent_st)
+    # A sticky shared directory (/tmp style) is acceptable because the file was just checked: owned by this user or root and not writable by others, so nobody else may unlink or rename it there.
+    problem = foreign_write_access(parent_st, root_may_own=True, sticky_may_share=True)
     if problem is not None:
         raise _UnusableAllowlistFile(
             f"its directory is {problem.description}", identity, lasting=False

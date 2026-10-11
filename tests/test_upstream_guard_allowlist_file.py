@@ -649,6 +649,70 @@ def test_the_failure_warning_shows_only_the_end_of_a_long_path(
     assert "d" * 10 not in warning
 
 
+@_POSIX_USER
+def test_an_own_file_in_a_sticky_shared_directory_is_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    allow_file = shared / "allowed"
+    _replace(allow_file, "http://127.0.0.1:4100")
+    monkeypatch.setenv(FILE_ENV, str(allow_file))
+    shared.chmod(0o1777)
+    try:
+        assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+    finally:
+        shared.chmod(0o700)
+
+
+@_POSIX_USER
+def test_a_group_writable_file_in_a_sticky_directory_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger="headroom.proxy.upstream_guard")
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    allow_file = shared / "allowed"
+    _replace(allow_file, "http://127.0.0.1:4100")
+    allow_file.chmod(0o664)
+    monkeypatch.setenv(FILE_ENV, str(allow_file))
+    shared.chmod(0o1777)
+    try:
+        assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+    finally:
+        shared.chmod(0o700)
+    (warning,) = [r.getMessage() for r in caplog.records]
+    assert "the file is writable by group or others (mode 0664)" in warning
+
+
+@_POSIX_USER
+def test_a_root_owned_file_in_a_root_owned_directory_is_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ConfigMap or bind mount read by a non-root proxy. Ownership cannot be given to root without being root, so the check sees root as the owner of everything here and the proxy as another user."""
+    from headroom.proxy import private_paths
+
+    mount = tmp_path / "mount"
+    mount.mkdir()
+    allow_file = mount / "allowed"
+    _replace(allow_file, "http://127.0.0.1:4100")
+    mount.chmod(0o755)
+    monkeypatch.setenv(FILE_ENV, str(allow_file))
+    real_check = private_paths.foreign_write_access
+
+    def as_root_owned(info: os.stat_result, **kwargs: bool):  # noqa: ANN202
+        owned_by_root = os.stat_result(
+            (info.st_mode, info.st_ino, info.st_dev, info.st_nlink, 0, 0, info.st_size, 0, 0, 0)
+        )
+        return real_check(owned_by_root, **kwargs)
+
+    real_uid = os.geteuid()
+    monkeypatch.setattr(upstream_guard, "foreign_write_access", as_root_owned)
+    monkeypatch.setattr(os, "geteuid", lambda: real_uid + 1)
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+
+
 def test_concurrent_checks_after_a_change_read_and_log_it_once(
     allow_file: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
