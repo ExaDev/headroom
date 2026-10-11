@@ -11,10 +11,13 @@ import socket
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
+from click.testing import CliRunner, Result
 from fastapi.testclient import TestClient
 
+from headroom.cli.main import main
 from headroom.proxy import upstream_guard
 from headroom.proxy.server import ProxyConfig, create_app
 from headroom.proxy.upstream_guard import is_safe_upstream_url
@@ -487,3 +490,60 @@ def test_a_running_proxy_admits_an_upstream_once_the_file_lists_it(allow_file: P
 
     assert admitted.status_code == 200, admitted.text
     assert upstream.hits == ["/v1/messages"]
+
+
+class TestCliOption:
+    """``headroom proxy --allowed-base-urls-file`` hands the path to the guard."""
+
+    def _invoke(self, args: list[str], env: dict[str, str | None]) -> tuple[Result, str | None]:
+        seen: dict[str, str | None] = {}
+
+        def fake_run_server(config: object, **kwargs: object) -> None:
+            seen["file"] = os.environ.get(FILE_ENV)
+
+        with patch("headroom.proxy.server.run_server", fake_run_server):
+            result = CliRunner().invoke(
+                main,
+                ["proxy", "--port", str(_free_port()), *args],
+                env={"HEADROOM_HOST": None, "HEADROOM_PORT": None, **env},
+            )
+        return result, seen.get("file")
+
+    def test_the_option_reaches_the_guard_before_the_server_starts(self, tmp_path: Path) -> None:
+        path = tmp_path / "allowed-base-urls"
+
+        result, seen = self._invoke(["--allowed-base-urls-file", str(path)], {FILE_ENV: None})
+
+        assert result.exit_code == 0, result.output
+        assert seen == str(path)
+
+    def test_a_relative_path_is_made_absolute(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+
+        result, seen = self._invoke(["--allowed-base-urls-file", "allowed"], {FILE_ENV: None})
+
+        assert result.exit_code == 0, result.output
+        assert seen == os.path.join(os.getcwd(), "allowed")
+
+    def test_the_environment_variable_is_the_option_s_default(self, tmp_path: Path) -> None:
+        path = tmp_path / "from-env"
+
+        result, seen = self._invoke([], {FILE_ENV: str(path)})
+
+        assert result.exit_code == 0, result.output
+        assert seen == str(path)
+
+    def test_a_directory_is_refused(self, tmp_path: Path) -> None:
+        result, seen = self._invoke(["--allowed-base-urls-file", str(tmp_path)], {FILE_ENV: None})
+
+        assert result.exit_code == 2
+        assert "is a directory" in result.output
+        assert seen is None
+
+    def test_the_option_is_in_the_help(self) -> None:
+        result = CliRunner().invoke(main, ["proxy", "--help"])
+
+        assert "--allowed-base-urls-file" in result.output
+        assert "HEADROOM_ALLOWED_BASE_URLS_FILE" in result.output

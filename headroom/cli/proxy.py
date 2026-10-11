@@ -264,6 +264,20 @@ def dashboard(port: int, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--allowed-base-urls-file",
+    default=None,
+    type=click.Path(dir_okay=False, resolve_path=False),
+    envvar="HEADROOM_ALLOWED_BASE_URLS_FILE",
+    help=(
+        "File of upstream hosts and URLs that x-headroom-base-url may name, in "
+        "the HEADROOM_ALLOWED_BASE_URLS format (commas, newlines or tabs between "
+        "entries, # comment lines), merged with that variable. Re-read whenever "
+        "it changes, with no restart; replace it atomically. Naming it means "
+        "allowlist mode even while it is empty, missing or unreadable "
+        "(env: HEADROOM_ALLOWED_BASE_URLS_FILE)."
+    ),
+)
+@click.option(
     "--workers",
     default=1,
     type=click.IntRange(min=1),
@@ -1056,6 +1070,7 @@ def proxy(
     host: str,
     port: int,
     uds: str | None,
+    allowed_base_urls_file: str | None,
     workers: int,
     limit_concurrency: int,
     max_connections: int,
@@ -1355,6 +1370,12 @@ def proxy(
             uds = checked_unix_socket_path(uds)
         except UnixSocketUnusableError as exc:
             raise click.ClickException(str(exc)) from None
+
+    if allowed_base_urls_file is not None:
+        from headroom.proxy.upstream_guard import ALLOWED_BASE_URLS_FILE_ENV
+
+        # The guard reads the environment on every check, in this process and in any worker it spawns, so the option is handed over there. Absolute, so a later change of working directory cannot repoint it; not symlink-resolved, so a supervisor may swap a link's target.
+        os.environ[ALLOWED_BASE_URLS_FILE_ENV] = os.path.abspath(allowed_base_urls_file)
 
     config = ProxyConfig(
         host=host,
