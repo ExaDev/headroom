@@ -630,7 +630,8 @@ def test_a_file_owned_by_another_user_is_refused(
 
     assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
     (warning,) = [r.getMessage() for r in caplog.records]
-    assert f"the file is owned by uid {real_uid}" in warning
+    # The directory is checked first and is owned by the same "other" user; the file's own owner check is covered case by case in tests/test_private_paths.py.
+    assert f"is owned by uid {real_uid}, not by the user running the proxy" in warning
 
 
 def test_the_failure_warning_shows_only_the_end_of_a_long_path(
@@ -757,6 +758,34 @@ def test_a_symlink_in_a_shared_directory_is_refused(
         shared.chmod(0o700)
     (warning,) = [r.getMessage() for r in caplog.records]
     assert "its directory is writable by group or others (mode 0777)" in warning
+
+
+@_POSIX_USER
+def test_a_cached_version_is_withheld_while_its_directory_is_unsafe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A directory made shared after the file was read is caught on the next check, not the next change."""
+    caplog.set_level(logging.INFO, logger="headroom.proxy.upstream_guard")
+    shared = tmp_path / "shared"
+    shared.mkdir(mode=0o700)
+    allow_file = shared / "allowed"
+    _replace(allow_file, "http://127.0.0.1:4100")
+    monkeypatch.setenv(FILE_ENV, str(allow_file))
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+    reads = _count_reads(monkeypatch)
+
+    shared.chmod(0o770)
+    try:
+        assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+        assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+    finally:
+        shared.chmod(0o700)
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+    assert reads == []
+    messages = [r.getMessage() for r in caplog.records]
+    assert len([m for m in messages if "its directory is writable by group or others" in m]) == 1
+    assert any(m.endswith("is usable again") for m in messages)
 
 
 def test_concurrent_checks_after_a_change_read_and_log_it_once(

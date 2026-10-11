@@ -29,7 +29,8 @@ Policy:
     sessions are still using. Replace it atomically (write a sibling, then
     rename over it): a change is detected by the file's identity (device,
     inode, size, and modification and status-change times), and an unchanged
-    file costs one ``stat`` per check, never a read. A version that cannot be
+    file is never read again; each check costs a ``stat`` of the file and of
+    the directories that could replace it, which are re-checked every time. A version that cannot be
     used is remembered the same way, so a broken file is not re-opened on
     every request.
 
@@ -335,31 +336,34 @@ class _UnusableAllowlistFile(Exception):
         return cls(_os_error_reason(exc), identity, lasting=exc.errno in _FILE_ERRNOS)
 
 
-def _require_private(
-    path: str, st: os.stat_result, identity: _FileIdentity, *, directory: bool = True
-) -> None:
-    """Raise :class:`_UnusableAllowlistFile` if a user other than this one or root could change the file.
+def _require_private_file(st: os.stat_result, identity: _FileIdentity) -> None:
+    """Raise :class:`_UnusableAllowlistFile` if a user other than this one or root could change the file itself.
 
-    The ``--uds`` directory rule (:func:`headroom.proxy.private_paths.foreign_write_access`), relaxed for a file that is only read: the file must be owned by this user or root and not writable by group or others; with ``directory``, the directory that holds the path must be owned by this user or root and either not writable by group or others, or sticky, where only an entry's owner can unlink or rename it. Root is trusted because it can change anything anyway, which is what lets root-owned bind mounts and ConfigMap volumes work for a proxy running as another user. A permission change on the file moves its status-change time, so that failure is remembered against the file's identity; one on the directory does not, so that failure is retried on every check until it clears. A cached good version is checked again whenever the file changes, which is the only way the directory's write access could reach it. Skipped where there is no ``os.geteuid`` (Windows), which has no POSIX ownership and modes to judge.
+    The ``--uds`` directory rule (:func:`headroom.proxy.private_paths.foreign_write_access`), relaxed for a file that is only read: owned by this user or root and not writable by group or others. Root is trusted because it can change anything anyway, which is what lets root-owned bind mounts and ConfigMap volumes work for a proxy running as another user. A permission or owner change moves the file's status-change time, so the failure is remembered against its identity. Skipped where there is no ``os.geteuid`` (Windows), which has no POSIX ownership and modes to judge.
     """
     if not hasattr(os, "geteuid"):
         return
     problem = foreign_write_access(st, root_may_own=True)
     if problem is not None:
         raise _UnusableAllowlistFile(f"the file is {problem.description}", identity)
-    if not directory:
-        return
-    for parent, which in _allowlist_directories(path):
+
+
+def _directory_problem(directories: list[tuple[str, str]]) -> str | None:
+    """Why someone other than this user or root could replace the file through one of ``directories``, else ``None``.
+
+    Each must be owned by this user or root and either not writable by group or others or sticky (``/tmp`` style), where only an entry's owner can unlink or rename it; that is safe because the file's own check requires it to be owned by this user or root. A directory's mode can change without the file changing, so this runs on every check, cached version or not, and its failure is never cached. Skipped where there is no ``os.geteuid`` (Windows).
+    """
+    if not hasattr(os, "geteuid"):
+        return None
+    for directory, which in directories:
         try:
-            parent_st = os.stat(parent)
+            info = os.stat(directory)
         except OSError as exc:
-            raise _UnusableAllowlistFile.from_os_error(exc, identity) from exc
-        # A sticky shared directory (/tmp style) is acceptable because the file was just checked: owned by this user or root and not writable by others, so nobody else may unlink or rename it there.
-        problem = foreign_write_access(parent_st, root_may_own=True, sticky_may_share=True)
+            return f"{which}: {_os_error_reason(exc)}"
+        problem = foreign_write_access(info, root_may_own=True, sticky_may_share=True)
         if problem is not None:
-            raise _UnusableAllowlistFile(
-                f"{which} is {problem.description}", identity, lasting=False
-            )
+            return f"{which} is {problem.description}"
+    return None
 
 
 def _allowlist_directories(path: str) -> list[tuple[str, str]]:
@@ -383,7 +387,7 @@ def _read_allowlist_file(path: str, st: os.stat_result) -> tuple[_FileIdentity, 
     identity = _FileIdentity.of(st)
     if not stat.S_ISREG(st.st_mode):
         raise _UnusableAllowlistFile("not a regular file", identity)
-    _require_private(path, st, identity)
+    _require_private_file(st, identity)
     try:
         fd = os.open(path, os.O_RDONLY | _O_NONBLOCK | _O_NOCTTY)
     except OSError as exc:
@@ -394,7 +398,7 @@ def _read_allowlist_file(path: str, st: os.stat_result) -> tuple[_FileIdentity, 
         identity = _FileIdentity.of(st)
         if not stat.S_ISREG(st.st_mode):
             raise _UnusableAllowlistFile("not a regular file", identity)
-        _require_private(path, st, identity, directory=False)
+        _require_private_file(st, identity)
         too_large = _UnusableAllowlistFile(
             f"larger than {_MAX_ALLOWLIST_FILE_BYTES} bytes", identity
         )
@@ -417,7 +421,7 @@ def _read_allowlist_file(path: str, st: os.stat_result) -> tuple[_FileIdentity, 
 class _AllowlistFiles:
     """What each allowlist file held, re-read only when the file's identity changes.
 
-    A version that could not be used is cached too, as ``None``, so a file that is oversized, not UTF-8 or unreadable costs one ``stat`` per check like a good one, not an open and a read on every request. A failure that is not the file's own (see ``_FILE_ERRNOS``) is not cached: that check fails closed and the next one tries again.
+    A version that could not be used is cached too, as ``None``, so a file that is oversized, not UTF-8 or unreadable costs the same ``stat`` calls per check as a good one, not an open and a read on every request. A good version is served only while its directories still pass :func:`_directory_problem`, checked on every request; failing that it is withheld, not dropped, and served again once they pass. A failure that is not the file's own (see ``_FILE_ERRNOS``) is not cached: that check fails closed and the next one tries again.
 
     Thread-safe: the event loop and the resolver pool both reach the guard. Checks against an unchanged file take only the bookkeeping lock. Checks that see a change queue on one reload lock and re-check the cache once they hold it, so a change is read and logged once however many requests arrive together. The wait is bounded in bytes (one read of at most ``_MAX_ALLOWLIST_FILE_BYTES``), not in time: a file on a stalled mount holds the reload, and every check that saw the change, for as long as the filesystem does, and a synchronous caller of :func:`is_safe_upstream_url` on the event loop blocks the loop meanwhile, as it already would on the ``stat``. Event-loop callers should use :func:`is_safe_upstream_url_async`, which runs the check on a worker thread.
     """
@@ -425,16 +429,42 @@ class _AllowlistFiles:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._reload_lock = threading.Lock()
-        self._loaded: dict[str, tuple[_FileIdentity, Destinations | None]] = {}
+        # path -> (identity of the version read, its entries or None when unusable, the directories to re-check)
+        self._loaded: dict[
+            str, tuple[_FileIdentity, Destinations | None, list[tuple[str, str]]]
+        ] = {}
         self._reported: dict[str, str] = {}
 
-    def _cached(self, path: str, identity: _FileIdentity) -> tuple[bool, Destinations | None]:
-        """``(True, what that version held)`` if ``identity`` is the version cached, else ``(False, None)``."""
+    def _cached(
+        self, path: str, identity: _FileIdentity
+    ) -> tuple[Destinations | None, list[tuple[str, str]]] | None:
+        """What the cached version held and its directories, if ``identity`` is that version, else ``None``."""
         with self._lock:
             cached = self._loaded.get(path)
         if cached is not None and cached[0] == identity:
-            return True, cached[1]
-        return False, None
+            return cached[1], cached[2]
+        return None
+
+    def _serve(
+        self,
+        path: str,
+        cached: tuple[Destinations | None, list[tuple[str, str]]],
+        file_env: str,
+        env: str,
+    ) -> Destinations | None:
+        """Return a cached version's entries if its directories are still safe."""
+        entries, directories = cached
+        if entries is None:
+            return None
+        problem = _directory_problem(directories)
+        if problem is not None:
+            self._report(path, problem, file_env, env)
+            return None
+        with self._lock:
+            recovered = self._reported.pop(path, None) is not None
+        if recovered:
+            logger.info("%s: %s is usable again", file_env, _logged_path(path))
+        return entries
 
     def load(self, path: str, file_env: str, env: str) -> Destinations | None:
         """Return ``path``'s entries, or ``None`` when it cannot be used.
@@ -448,25 +478,30 @@ class _AllowlistFiles:
             self._report(path, _os_error_reason(exc), file_env, env)
             return None
         identity = _FileIdentity.of(st)
-        hit, entries = self._cached(path, identity)
-        if hit:
-            return entries
+        cached = self._cached(path, identity)
+        if cached is not None:
+            return self._serve(path, cached, file_env, env)
         with self._reload_lock:
             # Another check may have read this very version while this one queued.
-            hit, entries = self._cached(path, identity)
-            if hit:
-                return entries
+            cached = self._cached(path, identity)
+            if cached is not None:
+                return self._serve(path, cached, file_env, env)
+            directories = _allowlist_directories(path)
+            problem = _directory_problem(directories)
+            if problem is not None:
+                self._report(path, problem, file_env, env)
+                return None
             try:
                 identity, raw = _read_allowlist_file(path, st)
             except _UnusableAllowlistFile as exc:
                 if exc.lasting:
                     with self._lock:
-                        self._loaded[path] = (exc.identity, None)
+                        self._loaded[path] = (exc.identity, None, directories)
                 self._report(path, str(exc), file_env, env)
                 return None
             entries, skipped = _parse_destinations(raw, comments=True)
             with self._lock:
-                self._loaded[path] = (identity, entries)
+                self._loaded[path] = (identity, entries, directories)
                 recovered = self._reported.pop(path, None) is not None
         logger.log(
             logging.WARNING if skipped else logging.INFO,
