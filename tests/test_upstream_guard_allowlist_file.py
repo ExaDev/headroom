@@ -1446,6 +1446,36 @@ def test_a_path_ending_in_a_directory_is_refused_as_not_a_regular_file(
     assert "(not a regular file)" in warning
 
 
+def test_a_lasting_disagreement_is_not_walked_again_until_the_file_changes(
+    allow_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _replace(allow_file, "http://127.0.0.1:4100")
+    real_fstat = os.fstat
+    real_walk = upstream_guard._path_directories
+    walks: list[str] = []
+
+    def always_something_else(fd: int) -> os.stat_result:
+        return _with_other_inode(real_fstat(fd))
+
+    def counting_walk(path: str):  # noqa: ANN202
+        walks.append(path)
+        return real_walk(path)
+
+    monkeypatch.setattr(os, "fstat", always_something_else)
+    monkeypatch.setattr(upstream_guard, "_path_directories", counting_walk)
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+    assert len(walks) == upstream_guard._RESOLVE_ATTEMPTS
+    for _ in range(3):
+        assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+    assert len(walks) == upstream_guard._RESOLVE_ATTEMPTS
+
+    monkeypatch.setattr(os, "fstat", real_fstat)
+    _replace(allow_file, "http://127.0.0.1:4100")
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+    assert len(walks) == upstream_guard._RESOLVE_ATTEMPTS + 1
+
+
 def test_concurrent_checks_after_a_change_read_and_log_it_once(
     allow_file: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
