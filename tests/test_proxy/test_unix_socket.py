@@ -437,10 +437,30 @@ class TestCliUdsFlag:
         assert "--uds cannot be combined with --port" in result.output
         assert config is None
 
-    def test_the_refusal_names_a_stored_setting_as_a_possible_source(self):
-        result, _ = self._invoke(["--uds", "/run/x/proxy.sock"], env={"HEADROOM_PORT": "9000"})
+    def test_a_stored_port_does_not_block_uds(self, socket_dir: Path, monkeypatch):
+        from headroom import settings_store
+
+        path = os.path.join(os.path.abspath(socket_dir), "proxy.sock")
+        # setenv then delenv, so monkeypatch restores the variable's absence when the stored value is applied.
+        for name in ("HEADROOM_PORT", "HEADROOM_HOST"):
+            monkeypatch.setenv(name, "x")
+            monkeypatch.delenv(name)
+        monkeypatch.setattr(settings_store, "_ENV_FROM_STORE", set())
+        monkeypatch.setattr(settings_store, "load", lambda: {"port": 9123})
+        result, config = self._invoke(["--uds", path])
+        assert result.exit_code == 0, result.output
+        assert config is not None
+        assert config.uds == path
+
+    def test_an_exported_port_still_blocks_uds_beside_a_stored_one(self, monkeypatch):
+        from headroom import settings_store
+
+        monkeypatch.setattr(settings_store, "_ENV_FROM_STORE", set())
+        monkeypatch.setattr(settings_store, "load", lambda: {"port": 9123})
+        result, config = self._invoke(["--uds", "/run/x/proxy.sock"], env={"HEADROOM_PORT": "9000"})
         assert result.exit_code == 2
-        assert "stored host or port setting" in result.output
+        assert "--uds cannot be combined with --port" in result.output
+        assert config is None
 
     def test_uds_reaches_proxy_config(self, socket_dir: Path):
         path = os.path.join(os.path.abspath(socket_dir), "proxy.sock")

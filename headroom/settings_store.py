@@ -1029,12 +1029,23 @@ def save(values: dict[str, Any]) -> None:
     _atomic_write_text(paths.settings_path(), payload)
 
 
+#: Environment variables this process filled in from the stored file, so a consumer that treats an explicit export differently from a stored value (``--uds`` refuses an exported port, not a saved one) can tell them apart.
+_ENV_FROM_STORE: set[str] = set()
+
+
+def env_came_from_store(name: str) -> bool:
+    """Whether *name* was set in this process by :func:`apply_to_environ` rather than exported."""
+    return name in _ENV_FROM_STORE
+
+
 def apply_to_environ(values: dict[str, Any]) -> None:
     """``setdefault`` each stored value into ``os.environ`` (explicit export wins)."""
     for key, value in values.items():
         field = _BY_KEY.get(key)
         if field is None or value is None:
             continue
+        if field.env not in os.environ:
+            _ENV_FROM_STORE.add(field.env)
         os.environ.setdefault(field.env, _serialize(field, value))
 
 

@@ -198,16 +198,26 @@ def _get_env_int(name: str, default: int) -> int:
 def _refuse_tcp_listen_options_with_uds(ctx: click.Context) -> None:
     """Reject ``--host``/``--port`` (from the command line or environment) alongside ``--uds``.
 
-    A unix socket listener binds no TCP address, so either value would be silently ignored. A stored setting reaches the options as an environment value, so it is refused the same way and the message names it as a possible source.
+    A unix socket listener binds no TCP address, so either value would be silently ignored. A host or port that only a stored setting supplied is not a request for a TCP listener, so it is not refused: otherwise one dashboard-saved port would stop every supervised ``--uds`` start.
     """
-    explicit = {click.core.ParameterSource.COMMANDLINE, click.core.ParameterSource.ENVIRONMENT}
-    conflicting = [
-        f"--{name}" for name in ("host", "port") if ctx.get_parameter_source(name) in explicit
-    ]
+    from headroom import settings_store
+
+    env_names = {"host": "HEADROOM_HOST", "port": "HEADROOM_PORT"}
+
+    def explicit(name: str) -> bool:
+        source = ctx.get_parameter_source(name)
+        if source == click.core.ParameterSource.COMMANDLINE:
+            return True
+        return (
+            source == click.core.ParameterSource.ENVIRONMENT
+            and not settings_store.env_came_from_store(env_names[name])
+        )
+
+    conflicting = [f"--{name}" for name in ("host", "port") if explicit(name)]
     if conflicting:
         raise click.UsageError(
             f"--uds cannot be combined with {', '.join(conflicting)} "
-            "(set on the command line, in HEADROOM_HOST/HEADROOM_PORT, or by a stored host or port setting)"
+            "(set on the command line or via HEADROOM_HOST/HEADROOM_PORT)"
         )
 
 
