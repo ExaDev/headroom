@@ -198,7 +198,7 @@ def _get_env_int(name: str, default: int) -> int:
 def _refuse_tcp_listen_options_with_uds(ctx: click.Context) -> None:
     """Reject ``--host``/``--port`` (from the command line or environment) alongside ``--uds``.
 
-    A unix socket listener binds no TCP address, so either value would be silently ignored.
+    A unix socket listener binds no TCP address, so either value would be silently ignored. A stored setting reaches the options as an environment value, so it is refused the same way and the message names it as a possible source.
     """
     explicit = {click.core.ParameterSource.COMMANDLINE, click.core.ParameterSource.ENVIRONMENT}
     conflicting = [
@@ -207,7 +207,7 @@ def _refuse_tcp_listen_options_with_uds(ctx: click.Context) -> None:
     if conflicting:
         raise click.UsageError(
             f"--uds cannot be combined with {', '.join(conflicting)} "
-            "(set on the command line or via HEADROOM_HOST/HEADROOM_PORT)"
+            "(set on the command line, in HEADROOM_HOST/HEADROOM_PORT, or by a stored host or port setting)"
         )
 
 
