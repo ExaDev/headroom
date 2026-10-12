@@ -360,14 +360,32 @@ class _UnusableAllowlistFile(Exception):
         return cls(_os_error_reason(exc), identity, lasting=exc.errno in _FILE_ERRNOS)
 
 
-def _remedy(problem: ForeignWriteAccess, subject: str) -> str:
-    """What the operator can do about ``problem`` with ``subject``, for the refusal's log line."""
+_MOVE_THE_FILE = "Move the allowlist file under a directory only you or root can write"
+
+
+def _file_remedy(problem: ForeignWriteAccess, st: os.stat_result) -> str:
+    """What to do about the file itself being changeable by another user, for the refusal's log line.
+
+    Moving it does not help, since the file travels with its owner and mode.
+    """
     if problem.other_owner:
-        return (
-            f"Make {subject} owned by uid {os.geteuid()} or root (chown), or keep the allowlist "
-            "file where every directory on its path is"
-        )
-    return f"Run chmod go-w on {subject}"
+        return f"Replace it with a copy owned by uid {os.geteuid()} or root that only its owner can write"
+    if st.st_uid == os.geteuid():
+        return "Run chmod go-w on the file"
+    return "Have root run chmod go-w on it, or replace it with a copy only you can write"
+
+
+def _directory_remedy(problem: ForeignWriteAccess, info: os.stat_result, directory: str) -> str:
+    """What to do about a directory on the path, for the refusal's log line.
+
+    Moving the file always works. Tightening the directory is offered only when it is the proxy user's own and not a sticky shared one: another user's directory (a home, a mount) is not the proxy's to change, root's needs root, and a sticky directory such as ``/tmp`` is shared on purpose, so making it private would break everything else that uses it.
+    """
+    own_private_candidate = (
+        not problem.other_owner and info.st_uid == os.geteuid() and not info.st_mode & stat.S_ISVTX
+    )
+    if own_private_candidate:
+        return f"{_MOVE_THE_FILE}, or run chmod go-w on {_logged_path(directory)}"
+    return _MOVE_THE_FILE
 
 
 def _require_private_file(st: os.stat_result, identity: _FileIdentity) -> None:
@@ -380,7 +398,7 @@ def _require_private_file(st: os.stat_result, identity: _FileIdentity) -> None:
     problem = foreign_write_access(st, root_may_own=True)
     if problem is not None:
         raise _UnusableAllowlistFile(
-            f"the file is {problem.description}. {_remedy(problem, 'the file')}", identity
+            f"the file is {problem.description}. {_file_remedy(problem, st)}", identity
         )
 
 
@@ -402,7 +420,7 @@ def _directory_problem(directories: list[str]) -> str | None:
         if problem is not None:
             return (
                 f"the directory {_logged_path(directory)} on its path is {problem.description}."
-                f" {_remedy(problem, _logged_path(directory))}"
+                f" {_directory_remedy(problem, info, directory)}"
             )
     return None
 
