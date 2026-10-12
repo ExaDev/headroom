@@ -201,6 +201,14 @@ def real_proxy(socket_dir: Path, tmp_path: Path):
 
 
 class TestRealProxyOverUnixSocket:
+    def test_readyz_answers_on_the_socket(self, real_proxy: Path):
+        response = _get(real_proxy, "/readyz")
+        # Readiness itself depends on the environment (an unreachable upstream is not ready); what is under test is that the real app answers its probe on the socket.
+        assert response.status_code in (200, 503)
+        body = response.json()
+        assert body["service"] == "headroom-proxy"
+        assert isinstance(body["ready"], bool)
+
     def test_socket_peer_reaches_a_loopback_only_route(self, real_proxy: Path):
         # A bare 404 would be the loopback guard refusing the peer; this body comes from the route itself.
         response = _get(real_proxy, "/stats/sessions/unknown-session")
@@ -354,6 +362,15 @@ class TestProxyConfigUds:
         with pytest.raises(ValueError, match="uds"):
             ProxyConfig(uds="")
 
+    def test_bind_policy_ignores_the_unused_host_of_a_socket_listener(self):
+        # A unix socket binds no interface, so a programmatic host cannot make it an open bind.
+        from headroom.proxy.bind_policy import evaluate_bind_policy
+
+        config = ProxyConfig(uds="/run/a/proxy.sock", host="0.0.0.0")
+        assert config.bind_policy_host is None
+        assert not evaluate_bind_policy(config.bind_policy_host, None, environ={}).refused
+        assert ProxyConfig(host="0.0.0.0").bind_policy_host == "0.0.0.0"
+
 
 class TestCliUdsFlag:
     def test_banner_and_config_use_the_resolved_path(self, socket_dir: Path, monkeypatch):
@@ -388,6 +405,23 @@ class TestCliUdsFlag:
         with patch("headroom.proxy.server.run_server", fake_run_server):
             result = CliRunner().invoke(main, ["proxy", *args], env=env or {})
         return result, captured.get("config")
+
+    def test_uds_from_the_environment_reaches_proxy_config(self, socket_dir: Path):
+        path = os.path.join(os.path.abspath(socket_dir), "proxy.sock")
+        result, config = self._invoke(
+            [], env={"HEADROOM_UDS": path, "HEADROOM_HOST": None, "HEADROOM_PORT": None}
+        )
+        assert result.exit_code == 0, result.output
+        assert config is not None
+        assert config.uds == path
+
+    def test_uds_from_the_environment_with_a_port_refused(self):
+        result, config = self._invoke(
+            [], env={"HEADROOM_UDS": "/run/x/proxy.sock", "HEADROOM_PORT": "9000"}
+        )
+        assert result.exit_code == 2
+        assert "--uds cannot be combined with --port" in result.output
+        assert config is None
 
     def test_uds_reaches_proxy_config(self, socket_dir: Path):
         path = os.path.join(os.path.abspath(socket_dir), "proxy.sock")
