@@ -135,3 +135,9 @@ def test_disabled_by_env(monkeypatch):
 
     monkeypatch.setattr(hard_watchdog, "_started", type(hard_watchdog._started)())
     assert hard_watchdog.start_hard_watchdog() is False
+
+
+def test_pytest_never_arms_the_production_watchdog():
+    """The conftest scrub must not strip CI's opt-out (#3845): ~100 test files
+    enter the proxy lifespan, and an armed watchdog hard-exits the whole shard."""
+    assert _resolve_secs() == 0.0

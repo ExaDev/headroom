@@ -46,14 +46,39 @@ class UnixSocketUnusableError(RuntimeError):
 
 
 def require_unix_sockets() -> None:
-    """Raise :class:`UnixSocketUnusableError` on a platform without ``socket.AF_UNIX``.
+    """Raise :class:`UnixSocketUnusableError` on a platform where the proxy cannot serve a unix socket.
 
-    Windows builds of Python define no ``AF_UNIX``, so ``--uds`` would otherwise die with an ``AttributeError`` the first time the socket module is asked for it. Entry points call this before doing any other work.
+    Windows builds of Python define no ``AF_UNIX``, so ``--uds`` would otherwise die with an ``AttributeError`` the first time the socket module is asked for it, and asyncio has no Windows unix socket transport even where the address family exists, so ``win32`` is refused outright. Entry points call this before doing any other work.
     """
-    if not hasattr(socket, "AF_UNIX"):
+    if sys.platform == "win32" or not hasattr(socket, "AF_UNIX"):
         raise UnixSocketUnusableError(
-            f"--uds needs unix domain sockets, which {sys.platform} does not provide"
+            f"--uds needs unix domain sockets, which {sys.platform} does not provide; "
+            "use --port instead"
         )
+
+
+# Docs page carrying the client-compatibility detail the banner has no room for.
+UDS_DOCS_URL = "https://headroom-docs.vercel.app/docs/proxy#serving-on-a-unix-socket"
+
+
+def socket_usage_lines(path: str | os.PathLike[str]) -> tuple[str, ...]:
+    """How the startup banner describes a socket bind, for every banner.
+
+    Deliberately names no agent and hands out no environment variables. An
+    earlier revision printed an ``ANTHROPIC_UNIX_SOCKET=... claude`` recipe here,
+    which is a configuration that does not work: it satisfies Claude Code's
+    ``api.anthropic.com`` host check but reclassifies the session as API-key
+    auth, and the session then fails to authenticate. Printing it at startup
+    turned a known-negative result into first-party guidance. The rule this
+    encodes is that the banner states a transport requirement and points at the
+    docs; per-client wiring belongs in the docs, where it can be qualified.
+    """
+    return (
+        f"  Socket:        {path}",
+        "  Client:        must support HTTP over a Unix socket natively",
+        f"  Example:       curl --unix-socket {path} http://localhost/health",
+        f"  Details:       {UDS_DOCS_URL}",
+    )
 
 
 @dataclass

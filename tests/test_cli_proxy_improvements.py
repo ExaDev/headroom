@@ -299,28 +299,20 @@ class TestMemoryTopKValidation:
 class TestMissingProxyDepsError:
     """When proxy dependencies are absent the CLI should print an actionable error and exit 1."""
 
-    @staticmethod
-    def _hide_module(monkeypatch: pytest.MonkeyPatch, hidden: str) -> None:
-        """Make ``ensure_proxy_dependencies`` fail to import *hidden*.
-
-        It imports through ``importlib.import_module``, which never calls ``builtins.__import__`` and returns a module already in ``sys.modules``, so faking ``__import__`` only worked when no earlier test had imported the module.
-        """
-        from headroom.cli import proxy as proxy_cli
-
-        real_import_module = proxy_cli.import_module
-
-        def fake_import_module(name: str, package: str | None = None) -> object:
-            if name == hidden:
-                raise ImportError(f"No module named '{hidden}'")
-            return real_import_module(name, package)
-
-        monkeypatch.setattr(proxy_cli, "import_module", fake_import_module)
-
     @pytest.mark.proxy_dependency_gate
     def test_proxy_command_exits_when_mcp_missing(
         self, runner: CliRunner, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        self._hide_module(monkeypatch, "mcp")
+        from importlib.util import find_spec
+
+        def fake_find_spec(name: str) -> object:
+            return None if name == "mcp" else find_spec(name)
+
+        monkeypatch.setattr("headroom.cli.proxy.find_spec", fake_find_spec)
+        monkeypatch.setattr(
+            "uvicorn.run",
+            lambda *args, **kwargs: pytest.fail("missing dependencies must not start a server"),
+        )
         result = runner.invoke(main, ["proxy"])
         assert result.exit_code == 1, result.output
         assert "pip install headroom-ai[proxy]" in result.output
@@ -332,7 +324,10 @@ class TestMissingProxyDepsError:
     ) -> None:
         from headroom.cli.proxy import ensure_proxy_dependencies
 
-        self._hide_module(monkeypatch, "fastapi")
+        monkeypatch.setattr(
+            "headroom.cli.proxy.find_spec",
+            lambda name: None if name == "fastapi" else object(),
+        )
 
         with pytest.raises(SystemExit) as exc_info:
             ensure_proxy_dependencies()
