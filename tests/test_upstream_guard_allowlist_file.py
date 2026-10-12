@@ -9,6 +9,7 @@ import errno
 import logging
 import os
 import socket
+import stat
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -651,7 +652,33 @@ def test_the_failure_warning_shows_only_the_end_of_a_long_path(
 
 
 @_POSIX_USER
-def test_an_own_file_in_a_sticky_shared_directory_is_accepted(
+def test_a_symlink_planted_in_a_sticky_shared_directory_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The /tmp attack: another user plants a link at the path to a file whose text admits loopback.
+
+    The link's owner cannot be made another user without root, and it does not need to be: any group- or other-writable directory is refused, sticky or not, so who planted the entry is never relied on.
+    """
+    caplog.set_level(logging.WARNING, logger="headroom.proxy.upstream_guard")
+    shared, theirs = tmp_path / "shared", tmp_path / "theirs"
+    shared.mkdir()
+    theirs.mkdir(mode=0o700)
+    hosts_like = theirs / "hosts"
+    hosts_like.write_text("127.0.0.1\tlocalhost\n", encoding="utf-8", newline="\n")
+    (shared / "headroom-allow").symlink_to(hosts_like)
+    monkeypatch.setenv(FILE_ENV, str(shared / "headroom-allow"))
+    shared.chmod(0o1777)
+    try:
+        assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+        assert is_safe_upstream_url("http://127.0.0.1:22/") is False
+    finally:
+        shared.chmod(0o700)
+    (warning,) = [r.getMessage() for r in caplog.records]
+    assert "its directory is writable by group or others (mode 1777)" in warning
+
+
+@_POSIX_USER
+def test_an_own_file_in_a_sticky_shared_directory_is_refused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     shared = tmp_path / "shared"
@@ -661,29 +688,43 @@ def test_an_own_file_in_a_sticky_shared_directory_is_accepted(
     monkeypatch.setenv(FILE_ENV, str(allow_file))
     shared.chmod(0o1777)
     try:
-        assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+        assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
     finally:
         shared.chmod(0o700)
 
 
 @_POSIX_USER
-def test_a_group_writable_file_in_a_sticky_directory_is_refused(
+def test_a_hard_link_to_a_root_owned_file_in_another_user_s_directory_is_refused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """On macOS anyone may hard-link a root-owned file into their own directory; the directory rule refuses it."""
+    from headroom.proxy import private_paths
+
     caplog.set_level(logging.WARNING, logger="headroom.proxy.upstream_guard")
-    shared = tmp_path / "shared"
-    shared.mkdir()
-    allow_file = shared / "allowed"
-    _replace(allow_file, "http://127.0.0.1:4100")
-    allow_file.chmod(0o664)
-    monkeypatch.setenv(FILE_ENV, str(allow_file))
-    shared.chmod(0o1777)
-    try:
-        assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
-    finally:
-        shared.chmod(0o700)
+    original, theirs = tmp_path / "original", tmp_path / "theirs"
+    original.mkdir(mode=0o700)
+    theirs.mkdir(mode=0o755)
+    _replace(original / "allowed", "http://127.0.0.1:4100")
+    os.link(original / "allowed", theirs / "allowed")
+    assert (theirs / "allowed").stat().st_nlink == 2
+    monkeypatch.setenv(FILE_ENV, str(theirs / "allowed"))
+    real_check = private_paths.foreign_write_access
+
+    def file_owned_by_root(info: os.stat_result, **kwargs: bool):  # noqa: ANN202
+        if stat.S_ISREG(info.st_mode):
+            info = os.stat_result(
+                (info.st_mode, info.st_ino, info.st_dev, info.st_nlink, 0, 0, info.st_size, 0, 0, 0)
+            )
+        return real_check(info, **kwargs)
+
+    real_uid = os.geteuid()
+    monkeypatch.setattr(upstream_guard, "foreign_write_access", file_owned_by_root)
+    # The directory keeps its real owner, which is now "another user".
+    monkeypatch.setattr(os, "geteuid", lambda: real_uid + 1)
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
     (warning,) = [r.getMessage() for r in caplog.records]
-    assert "the file is writable by group or others (mode 0664)" in warning
+    assert f"its directory is owned by uid {real_uid}, not by the user running the proxy" in warning
 
 
 @_POSIX_USER

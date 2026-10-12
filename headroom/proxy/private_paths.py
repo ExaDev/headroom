@@ -22,21 +22,21 @@ class ForeignWriteAccess:
 
 
 def foreign_write_access(
-    info: os.stat_result, *, root_may_own: bool = False, sticky_may_share: bool = False
+    info: os.stat_result, *, root_may_own: bool = False
 ) -> ForeignWriteAccess | None:
     """Return why another user could change the file or directory ``info`` describes, else ``None``.
 
     Its owner can always change it, so an owner other than the current effective user is refused first; otherwise group or other write permission is. For a directory, write permission is what allows unlinking or renaming its entries, whoever owns them, so either lets someone else replace what the directory holds.
 
-    The two relaxations are for paths the proxy only reads, never binds, and are off by default, which is the ``--uds`` rule. ``root_may_own`` also accepts uid 0, which can change anything anyway, so trusting it adds no one (bind mounts and Kubernetes ConfigMap volumes are root-owned while the proxy runs as another user). ``sticky_may_share`` accepts a group- or other-writable directory with the sticky bit set, where only an entry's owner (or the directory's, or root) can unlink or rename it; that is safe only together with a check that the entry itself is owned by the user or root and not writable by others, which the caller must make.
+    The sticky bit is never a substitute for write permission: in a sticky shared directory anyone can still create a new entry, such as a symlink to a file of their choosing or (where hard links to others' files are allowed) a hard link to one, at a path nobody has claimed yet, and checking the file that entry leads to cannot tell who made it.
+
+    ``root_may_own`` relaxes the owner rule for paths the proxy only reads, never binds; it is off by default, which is the ``--uds`` rule. It also accepts uid 0, which can change anything anyway, so trusting it adds no one (bind mounts and Kubernetes ConfigMap volumes are root-owned while the proxy runs as another user).
     """
     euid = os.geteuid()
     if info.st_uid != euid and not (root_may_own and info.st_uid == 0):
         owners = f"the user running the proxy (uid {euid})" + (" or root" if root_may_own else "")
         return ForeignWriteAccess(f"owned by uid {info.st_uid}, not by {owners}", other_owner=True)
-    if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH) and not (
-        sticky_may_share and info.st_mode & stat.S_ISVTX
-    ):
+    if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
         return ForeignWriteAccess(
             f"writable by group or others (mode {stat.S_IMODE(info.st_mode):04o})",
             other_owner=False,

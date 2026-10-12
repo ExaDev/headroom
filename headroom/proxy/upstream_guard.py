@@ -352,7 +352,7 @@ def _require_private_file(st: os.stat_result, identity: _FileIdentity) -> None:
 def _directory_problem(directories: list[tuple[str, str]]) -> str | None:
     """Why someone other than this user or root could replace the file through one of ``directories``, else ``None``.
 
-    Each must be owned by this user or root and either not writable by group or others or sticky (``/tmp`` style), where only an entry's owner can unlink or rename it; that is safe because the file's own check requires it to be owned by this user or root. A directory's mode can change without the file changing, so this runs on every check, cached version or not, and its failure is never cached. Skipped where there is no ``os.geteuid`` (Windows).
+    Each must be owned by this user or root and not writable by group or others, sticky or not: in a shared directory such as ``/tmp`` anyone can plant the entry first (a symlink to a file of their choosing, or a hard link to a root-owned one), and the file it leads to cannot show who planted it. A directory's mode can change without the file changing, so this runs on every check, cached version or not, and its failure is never cached. Skipped where there is no ``os.geteuid`` (Windows).
     """
     if not hasattr(os, "geteuid"):
         return None
@@ -361,7 +361,7 @@ def _directory_problem(directories: list[tuple[str, str]]) -> str | None:
             info = os.stat(directory)
         except OSError as exc:
             return f"{which}: {_os_error_reason(exc)}"
-        problem = foreign_write_access(info, root_may_own=True, sticky_may_share=True)
+        problem = foreign_write_access(info, root_may_own=True)
         if problem is not None:
             return f"{which} is {problem.description}"
     return None
