@@ -35,8 +35,10 @@ Policy:
     broken file is not re-opened on every request.
 
 What the file lists is only trusted if nobody but the user running the proxy
-or root could have chosen which file the path reaches (the rule OpenSSH's
-StrictModes applies to authorized_keys). The file must be owned by that user or
+or root could have chosen which file the path reaches. The rule is stricter
+than OpenSSH's StrictModes for authorized_keys (no sticky exception, and every
+directory a symlink passes through counts), but like it, it judges owners and
+mode bits only. The file must be owned by that user or
 root and not writable by group or others, and so must every directory that
 resolving the path passes through: every directory from ``/`` down to the one
 holding the file, and, when the path meets a symlink anywhere along it, every
@@ -47,6 +49,12 @@ there included. Because each of those directories can be changed only by the
 user or root, nobody else can swap an entry between this check and the
 ``open`` that follows it, so the ``open`` resolving the path again by name
 reaches the file the check judged, and no descriptor-relative walk is needed.
+What is not judged: access control lists, which can grant write access the
+mode bits do not show (a macOS ACL such as ``everyone allow
+add_file,delete_child`` on a directory or ``allow write,append`` on the file,
+and NFSv4 ACLs; a POSIX ACL is covered, because its mask appears as the group
+bits), and the truth of the ownership a filesystem reports (a FUSE mount with
+``allow_other``, NFS without ``root_squash``).
 
 Naming a file is itself the operator's choice of allowlist mode, so it never
 falls back to the public-host default, whatever state the file is in:
