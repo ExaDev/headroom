@@ -1305,6 +1305,39 @@ def _ancestors_of(directory: str) -> list[str]:
         directory = parent
 
 
+@_POSIX_USER
+def test_an_absolute_path_loads_with_the_working_directory_gone(
+    allow_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    upstream_guard._RESOLVED_ALLOWLIST_PATHS.clear()
+    _replace(allow_file, "http://127.0.0.1:4100")
+    gone = tmp_path / "gone"
+    gone.mkdir()
+    monkeypatch.chdir(gone)
+    gone.rmdir()
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+
+
+@_POSIX_USER
+def test_a_relative_path_with_the_working_directory_gone_is_refused_not_raised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger="headroom.proxy.upstream_guard")
+    upstream_guard._RESOLVED_ALLOWLIST_PATHS.clear()
+    gone = tmp_path / "gone"
+    gone.mkdir()
+    monkeypatch.chdir(gone)
+    gone.rmdir()
+    monkeypatch.setenv(FILE_ENV, "allowed")
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+    (warning,) = [r.getMessage() for r in caplog.records]
+    assert "cannot resolve the relative path against the working directory" in warning
+    assert "allowed" not in upstream_guard._RESOLVED_ALLOWLIST_PATHS
+
+
 def test_concurrent_checks_after_a_change_read_and_log_it_once(
     allow_file: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1713,6 +1746,25 @@ class TestCliOption:
 
         assert result.exit_code == 0, result.output
         assert seen == str(tmp_path / "allowed")
+
+    @_POSIX_USER
+    def test_a_relative_option_with_the_working_directory_gone_is_a_clean_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        upstream_guard._RESOLVED_ALLOWLIST_PATHS.clear()
+        gone = tmp_path / "gone"
+        gone.mkdir()
+        monkeypatch.chdir(gone)
+        gone.rmdir()
+
+        result, seen = self._invoke(["--allowed-base-urls-file", "allowed"], {FILE_ENV: None})
+
+        assert result.exit_code == 1, result.output
+        assert (
+            "cannot resolve --allowed-base-urls-file 'allowed' against the working directory"
+            in result.output
+        )
+        assert seen is None
 
     def test_the_option_is_in_the_help(self) -> None:
         result = CliRunner().invoke(main, ["proxy", "--help"])

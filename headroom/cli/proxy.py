@@ -1380,9 +1380,15 @@ def proxy(
         allowed_base_urls_file = allowed_base_urls_file.strip()
         if allowed_base_urls_file:
             # The guard reads the environment on every check, in this process and in any worker it spawns, so the option is handed over there, resolved the way the guard resolves it so a worker started in another directory still names the same file.
-            os.environ[ALLOWED_BASE_URLS_FILE_ENV] = resolve_allowlist_file_path(
-                allowed_base_urls_file
-            )
+            try:
+                os.environ[ALLOWED_BASE_URLS_FILE_ENV] = resolve_allowlist_file_path(
+                    allowed_base_urls_file
+                )
+            except OSError as exc:
+                raise click.ClickException(
+                    f"cannot resolve --allowed-base-urls-file {allowed_base_urls_file!r} against "
+                    f"the working directory: {exc.strerror}"
+                ) from None
         else:
             # Blank means no file, as a blank HEADROOM_ALLOWED_BASE_URLS means no list. Set to "" rather than removed: create_app re-applies stored settings with setdefault (in this process and in every worker), which would put a stored path back into a missing variable but leaves a present one alone, so an explicit `--allowed-base-urls-file ""` overrides a stored or inherited path.
             os.environ[ALLOWED_BASE_URLS_FILE_ENV] = ""
