@@ -622,6 +622,10 @@ class _AllowlistFiles:
         )
         return entries
 
+    def report_unresolvable(self, raw_path: str, reason: str, file_env: str, env: str) -> None:
+        """Report, once, a path that could not even be resolved to an absolute one."""
+        self._report(raw_path, reason, file_env, env)
+
     def _report(self, path: str, reason: str, file_env: str, env: str) -> None:
         """Log a failure once, until it changes or the file is read again."""
         with self._lock:
@@ -741,12 +745,13 @@ _RESOLVED_ALLOWLIST_PATHS_LOCK = threading.Lock()
 def resolve_allowlist_file_path(raw: str) -> str:
     """Return the file ``raw`` names, with ``~`` expanded and a relative path made absolute.
 
-    A relative path resolves against the working directory at its first use in this process and keeps that meaning afterwards, so a later change of directory cannot repoint the allowlist. ``~user`` for a user that does not exist is left as written, as ``os.path.expanduser`` leaves it, and so is a relative path like any other. Symlinks are not resolved, so a supervisor may swap a link's target, and nothing else is normalised either: ``..`` and a trailing slash are left for the kernel and for :func:`_path_directories`, which both take ``..`` after following any symlink before it (``dir/link/..`` is the link target's parent, not ``dir``), and a trailing slash makes a regular file fail to resolve, as it would for ``open``. ``raw`` must already be stripped and not blank.
+    A relative path resolves against the working directory at its first use in this process and keeps that meaning afterwards, so a later change of directory cannot repoint the allowlist. ``~user`` for a user that does not exist is left as written, as ``os.path.expanduser`` leaves it, and so is a relative path like any other. Symlinks are not resolved, so a supervisor may swap a link's target, and nothing else is normalised either: ``..`` and a trailing slash are left for the kernel and for :func:`_path_directories`, which both take ``..`` after following any symlink before it (``dir/link/..`` is the link target's parent, not ``dir``), and a trailing slash makes a regular file fail to resolve, as it would for ``open``. ``raw`` must already be stripped and not blank. Raises ``OSError`` when a relative path needs a working directory that no longer exists; that is not remembered, so a later call tries again. An absolute path never consults the working directory.
     """
     with _RESOLVED_ALLOWLIST_PATHS_LOCK:
         resolved = _RESOLVED_ALLOWLIST_PATHS.get(raw)
         if resolved is None:
-            resolved = os.path.join(os.getcwd(), os.path.expanduser(raw))
+            expanded = os.path.expanduser(raw)
+            resolved = expanded if os.path.isabs(expanded) else os.path.join(os.getcwd(), expanded)
             _RESOLVED_ALLOWLIST_PATHS[raw] = resolved
     return resolved
 
@@ -766,8 +771,19 @@ def allowlisted_destinations(
     raw_path = (os.environ.get(file_env) or "").strip()
     if not raw_path:
         return listed
-    path = resolve_allowlist_file_path(raw_path)
-    from_file = _ALLOWLIST_FILES.load(path, file_env, env) or _NO_DESTINATIONS
+    try:
+        path = resolve_allowlist_file_path(raw_path)
+    except OSError as exc:
+        # A relative path with no working directory to resolve it against: refused for this check, reported once, and tried again on the next.
+        _ALLOWLIST_FILES.report_unresolvable(
+            raw_path,
+            f"cannot resolve the relative path against the working directory: {_os_error_reason(exc)}",
+            file_env,
+            env,
+        )
+        from_file = _NO_DESTINATIONS
+    else:
+        from_file = _ALLOWLIST_FILES.load(path, file_env, env) or _NO_DESTINATIONS
     if listed is None:
         return from_file
     return listed[0] | from_file[0], listed[1] | from_file[1]
