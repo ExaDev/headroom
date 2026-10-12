@@ -957,6 +957,31 @@ def test_a_symlink_chain_past_the_walk_limit_is_refused(
     assert "its symlinks go more than 1 deep" in warning
 
 
+@_POSIX_USER
+def test_a_cached_version_is_withheld_when_its_directory_cannot_be_stat_ed(
+    allow_file: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger="headroom.proxy.upstream_guard")
+    _replace(allow_file, "http://127.0.0.1:4100")
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+    directory = os.path.realpath(allow_file.parent)
+    real_stat = os.stat
+
+    def directory_unreachable(path: object, *args: object, **kwargs: object) -> os.stat_result:
+        if os.fspath(path) == directory:  # type: ignore[arg-type]
+            raise OSError(errno.EIO, os.strerror(errno.EIO), directory)
+        return real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "stat", directory_unreachable)
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+    (warning,) = [r.getMessage() for r in caplog.records]
+    assert "its directory: Input/output error (EIO)" in warning
+
+    monkeypatch.setattr(os, "stat", real_stat)
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+
+
 def test_concurrent_checks_after_a_change_read_and_log_it_once(
     allow_file: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
