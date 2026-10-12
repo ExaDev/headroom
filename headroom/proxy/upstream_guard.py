@@ -355,7 +355,7 @@ class _UnusableAllowlistFile(Exception):
 def _require_private_file(st: os.stat_result, identity: _FileIdentity) -> None:
     """Raise :class:`_UnusableAllowlistFile` if a user other than this one or root could change the file itself.
 
-    The ``--uds`` directory rule (:func:`headroom.proxy.private_paths.foreign_write_access`), relaxed for a file that is only read: owned by this user or root and not writable by group or others. Root is trusted because it can change anything anyway, which is what lets root-owned bind mounts and ConfigMap volumes work for a proxy running as another user. A permission or owner change moves the file's status-change time, so the failure is remembered against its identity. Skipped where there is no ``os.geteuid`` (Windows), which has no POSIX ownership and modes to judge.
+    The ``--uds`` directory rule (:func:`headroom.proxy.private_paths.foreign_write_access`), relaxed for a file that is only read: owned by this user or root and not writable by group or others. Root is trusted because it can change anything anyway, which is what lets a proxy running as another user read a root-owned file in a root-owned directory. A permission or owner change moves the file's status-change time, so the failure is remembered against its identity. Skipped where there is no ``os.geteuid`` (Windows), which has no POSIX ownership and modes to judge.
     """
     if not hasattr(os, "geteuid"):
         return
