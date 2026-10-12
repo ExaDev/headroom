@@ -900,6 +900,63 @@ def test_an_unknown_user_s_home_is_left_as_written(
     assert resolved == str(tmp_path / "~no-such-user-headroom" / "allowed")
 
 
+@_POSIX_USER
+def test_a_symlink_chain_through_a_shared_directory_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """priv/allow -> shared/mid -> safe/real: both ends are private, but whoever writes shared/ can repoint mid."""
+    caplog.set_level(logging.WARNING, logger="headroom.proxy.upstream_guard")
+    priv, shared, safe = tmp_path / "priv", tmp_path / "shared", tmp_path / "safe"
+    for directory in (priv, shared, safe):
+        directory.mkdir(mode=0o700)
+    _replace(safe / "real", "http://127.0.0.1:4100")
+    (shared / "mid").symlink_to(safe / "real")
+    (priv / "allow").symlink_to(shared / "mid")
+    monkeypatch.setenv(FILE_ENV, str(priv / "allow"))
+    shared.chmod(0o777)
+    try:
+        assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+    finally:
+        shared.chmod(0o700)
+    (warning,) = [r.getMessage() for r in caplog.records]
+    assert (
+        "the directory of a symlink it passes through is writable by group or others (mode 0777)"
+        in warning
+    )
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+
+
+def test_a_relative_symlink_hop_resolves_against_the_link_s_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    priv, safe = tmp_path / "priv", tmp_path / "safe"
+    priv.mkdir(mode=0o700)
+    safe.mkdir(mode=0o700)
+    _replace(safe / "real", "http://127.0.0.1:4100")
+    (priv / "allow").symlink_to(Path("..") / "safe" / "real")
+    monkeypatch.setenv(FILE_ENV, str(priv / "allow"))
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+    directories = [d for d, _ in upstream_guard._allowlist_directories(str(priv / "allow"))]
+    assert directories == [os.path.realpath(priv), os.path.realpath(safe)]
+
+
+def test_a_symlink_chain_past_the_walk_limit_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger="headroom.proxy.upstream_guard")
+    monkeypatch.setattr(upstream_guard, "_MAX_SYMLINK_HOPS", 1)
+    _replace(tmp_path / "real", "http://127.0.0.1:4100")
+    (tmp_path / "mid").symlink_to(tmp_path / "real")
+    (tmp_path / "allow").symlink_to(tmp_path / "mid")
+    monkeypatch.setenv(FILE_ENV, str(tmp_path / "allow"))
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+    (warning,) = [r.getMessage() for r in caplog.records]
+    assert "its symlinks go more than 1 deep" in warning
+
+
 def test_concurrent_checks_after_a_change_read_and_log_it_once(
     allow_file: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
