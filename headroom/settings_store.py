@@ -56,6 +56,8 @@ class SettingField:
     minimum: float | None = None
     maximum: float | None = None
     tier: str = "advanced"  # "basic" | "advanced" - Settings vs Advanced tab placement
+    # A set but blank variable is itself an override meaning "no value", as the CLI exports for an explicit blank option, rather than being treated as unset.
+    blank_overrides: bool = False
 
 
 # Curated registry. Env formats verified against each knob's Click option in
@@ -739,6 +741,7 @@ SETTINGS: tuple[SettingField, ...] = (
             "are re-read whenever it changes, with no restart."
         ),
         tier="advanced",
+        blank_overrides=True,
     ),
 )
 
@@ -998,13 +1001,20 @@ def effective_values(stored: dict[str, Any] | None = None) -> dict[str, Any]:
     for field in SETTINGS:
         value = stored[field.key] if field.key in stored else field.default
         env_raw = os.environ.get(field.env)
-        if env_raw is not None and env_raw != "":
+        if _env_overrides_blank(field, env_raw):
+            value = None
+        elif env_raw is not None and env_raw != "":
             try:
                 value = _coerce(field, env_raw)
             except (ValueError, TypeError):
                 pass  # unparseable env: keep the file/default value
         result[field.key] = value
     return result
+
+
+def _env_overrides_blank(field: SettingField, env_raw: str | None) -> bool:
+    """Whether ``env_raw`` is a set but blank value that ``field`` treats as an override with no value."""
+    return field.blank_overrides and env_raw is not None and env_raw.strip() == ""
 
 
 def _mask(field: SettingField, value: Any) -> Any:
@@ -1046,7 +1056,8 @@ def to_schema() -> dict[str, Any]:
                 "minimum": field.minimum,
                 "maximum": field.maximum,
                 "tier": field.tier,
-                "env_override": bool(os.environ.get(field.env)),
+                "env_override": bool(os.environ.get(field.env))
+                or _env_overrides_blank(field, os.environ.get(field.env)),
                 "value": _mask(field, effective.get(field.key)),
                 "stored": _mask(field, stored.get(field.key)),
             }
