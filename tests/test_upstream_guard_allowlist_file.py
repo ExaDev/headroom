@@ -653,8 +653,9 @@ def test_a_file_in_a_group_writable_directory_is_refused_until_it_is_fixed(
     assert len(warnings) == 1
     assert _on_its_path(shared, "writable by group or others (mode 0770)") in warnings[0]
     assert (
-        f"Run chmod go-w on {upstream_guard._logged_path(os.path.realpath(shared))}" in warnings[0]
-    )
+        "Move the allowlist file under a directory only you or root can write, "
+        f"or run chmod go-w on {upstream_guard._logged_path(os.path.realpath(shared))}"
+    ) in warnings[0]
 
 
 @_POSIX_USER
@@ -1105,7 +1106,7 @@ def _fabricated(uid: int, mode: int) -> os.stat_result:
 
 
 @pytest.mark.parametrize(
-    ("tree", "refused_at"),
+    ("tree", "refused_at", "remedy"),
     [
         (
             {
@@ -1115,18 +1116,24 @@ def _fabricated(uid: int, mode: int) -> os.stat_result:
                 "/home/me/cfg": (_ME, 0o700),
             },
             None,
+            None,
         ),
         (
             {"/": (_ROOT, 0o755), "/etc": (_ROOT, 0o755), "/etc/headroom": (_ROOT, 0o755)},
+            None,
             None,
         ),
         (
             {"/": (_ROOT, 0o755), "/tmp": (_ROOT, 0o1777), "/tmp/mine": (_ME, 0o700)},
             ("/tmp", "writable by group or others (mode 1777)"),
+            # Never "chmod go-w /tmp": it is shared on purpose.
+            "Move the allowlist file under a directory only you or root can write",
         ),
         (
             {"/": (_ROOT, 0o755), "/srv": (_ROOT, 0o775), "/srv/headroom": (_ME, 0o700)},
             ("/srv", "writable by group or others (mode 0775)"),
+            # Root's directory: tightening it needs root, so only moving is suggested.
+            "Move the allowlist file under a directory only you or root can write",
         ),
         (
             {
@@ -1139,17 +1146,33 @@ def _fabricated(uid: int, mode: int) -> os.stat_result:
                 "/home/them",
                 "owned by uid 2000, not by the user running the proxy (uid 1000) or root",
             ),
+            # Another user's home is not the proxy's to chown.
+            "Move the allowlist file under a directory only you or root can write",
+        ),
+        (
+            {"/": (_ROOT, 0o755), "/home": (_ROOT, 0o755), "/home/me": (_ME, 0o770)},
+            ("/home/me", "writable by group or others (mode 0770)"),
+            "Move the allowlist file under a directory only you or root can write"
+            + ", or run chmod go-w on '/home/me'",
         ),
     ],
-    ids=["home", "root-controlled", "under-tmp", "group-writable-ancestor", "other-user-ancestor"],
+    ids=[
+        "home",
+        "root-controlled",
+        "under-tmp",
+        "group-writable-ancestor",
+        "other-user-ancestor",
+        "own-group-writable",
+    ],
 )
 def test_every_directory_on_the_path_must_be_trusted(
     real_ancestors: None,
     monkeypatch: pytest.MonkeyPatch,
     tree: dict[str, tuple[int, int]],
     refused_at: tuple[str, str] | None,
+    remedy: str | None,
 ) -> None:
-    """The ancestor rule on fabricated ``lstat`` results, so it does not depend on this machine's /tmp."""
+    """The ancestor rule, and the remedy it suggests, on fabricated ``lstat`` results, so it does not depend on this machine's /tmp."""
     monkeypatch.setattr(os, "geteuid", lambda: _ME)
     monkeypatch.setattr(os, "lstat", lambda path: _fabricated(*tree[os.fspath(path)]))
 
@@ -1160,13 +1183,6 @@ def test_every_directory_on_the_path_must_be_trusted(
     else:
         directory, description = refused_at
         logged = upstream_guard._logged_path(directory)
-        if description.startswith("owned by"):
-            remedy = (
-                f"Make {logged} owned by uid {_ME} or root (chown), or keep the allowlist file "
-                "where every directory on its path is"
-            )
-        else:
-            remedy = f"Run chmod go-w on {logged}"
         assert problem == f"the directory {logged} on its path is {description}. {remedy}"
 
 
@@ -1336,6 +1352,26 @@ def test_a_relative_path_with_the_working_directory_gone_is_refused_not_raised(
     (warning,) = [r.getMessage() for r in caplog.records]
     assert "cannot resolve the relative path against the working directory" in warning
     assert "allowed" not in upstream_guard._RESOLVED_ALLOWLIST_PATHS
+
+
+@_POSIX_USER
+def test_a_sticky_directory_on_the_path_is_never_advised_chmod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger="headroom.proxy.upstream_guard")
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    (shared / "mine").mkdir(mode=0o700)
+    _replace(shared / "mine" / "allow", "http://127.0.0.1:4100")
+    monkeypatch.setenv(FILE_ENV, str(shared / "mine" / "allow"))
+    shared.chmod(0o1777)
+    try:
+        assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+    finally:
+        shared.chmod(0o700)
+    (warning,) = [r.getMessage() for r in caplog.records]
+    assert "Move the allowlist file under a directory only you or root can write)" in warning
+    assert "chmod" not in warning
 
 
 def test_concurrent_checks_after_a_change_read_and_log_it_once(
