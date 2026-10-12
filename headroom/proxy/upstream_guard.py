@@ -449,11 +449,13 @@ def _path_directories(path: str) -> tuple[list[str], str | None]:
     hops = 0
     while pending:
         name = pending.pop()
-        if name in ("", "."):
+        if name == "":
             continue
-        if name == "..":
-            # `current` is symlink-free, so its lexical parent is its real one.
-            current = os.path.dirname(current)
+        if name in (".", ".."):
+            # `current` is symlink-free, so its lexical parent is its real one. A path ending here names that directory, so it is the entry the walk ends at.
+            if name == "..":
+                current = os.path.dirname(current)
+            final = current
             continue
         if current not in seen:
             seen.add(current)

@@ -1432,6 +1432,20 @@ def test_the_file_opened_must_be_the_file_the_walk_agreed_on(
         assert "the path does not resolve to the file the permission check inspected" in warning
 
 
+@pytest.mark.parametrize("suffix", ["sub/..", "sub/.", "."])
+def test_a_path_ending_in_a_directory_is_refused_as_not_a_regular_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, suffix: str
+) -> None:
+    caplog.set_level(logging.WARNING, logger="headroom.proxy.upstream_guard")
+    upstream_guard._RESOLVED_ALLOWLIST_PATHS.clear()
+    (tmp_path / "sub").mkdir(mode=0o700)
+    monkeypatch.setenv(FILE_ENV, f"{tmp_path}/{suffix}")
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+    (warning,) = [r.getMessage() for r in caplog.records]
+    assert "(not a regular file)" in warning
+
+
 def test_concurrent_checks_after_a_change_read_and_log_it_once(
     allow_file: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
