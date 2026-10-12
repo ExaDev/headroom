@@ -1255,6 +1255,56 @@ def test_a_trailing_slash_on_a_regular_file_is_refused(
     assert "Not a directory (ENOTDIR)" in warning
 
 
+@_POSIX_USER
+def test_an_unsafe_directory_at_any_depth_above_tmp_path_is_refused(
+    real_ancestors: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the scaffolding off, each real directory above tmp_path in turn reports mode 0777; every one must refuse.
+
+    The others report as root-owned 0755 so the outcome depends only on the one made unsafe, on any machine (on Linux /tmp would otherwise refuse them all). A walk that skipped any depth, the second level or everything between / and depth 4, fails here.
+    """
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    _replace(private / "allow", "http://127.0.0.1:4100")
+    monkeypatch.setenv(FILE_ENV, str(private / "allow"))
+    below = os.path.realpath(tmp_path)
+    above = [d for d in _ancestors_of(below) if d != below]
+    assert above[0] == os.sep and len(above) >= 2
+    real_lstat = os.lstat
+    unsafe: list[str] = []
+
+    def ancestors_as_configured(path: object, *args: object, **kwargs: object) -> os.stat_result:
+        real = real_lstat(path, *args, **kwargs)  # type: ignore[arg-type]
+        name = os.fspath(path)  # type: ignore[arg-type]
+        if name in above:
+            mode = 0o777 if unsafe and name == unsafe[0] else 0o755
+            return os.stat_result(
+                (stat.S_IFDIR | mode, real.st_ino, real.st_dev, 1, 0, 0, 0, 0, 0, 0)
+            )
+        return real
+
+    monkeypatch.setattr(os, "lstat", ancestors_as_configured)
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+
+    for directory in above:
+        unsafe[:] = [directory]
+        assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False, directory
+
+    unsafe.clear()
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+
+
+def _ancestors_of(directory: str) -> list[str]:
+    """``directory`` and every directory above it, from ``/`` down."""
+    chain = []
+    while True:
+        chain.append(directory)
+        parent = os.path.dirname(directory)
+        if parent == directory:
+            return list(reversed(chain))
+        directory = parent
+
+
 def test_concurrent_checks_after_a_change_read_and_log_it_once(
     allow_file: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
