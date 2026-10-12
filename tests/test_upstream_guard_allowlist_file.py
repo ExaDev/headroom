@@ -50,6 +50,39 @@ def _count_reads(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
 
 @pytest.fixture
+def real_ancestors() -> None:
+    """Requested by a test that judges the real directories above ``tmp_path``."""
+
+
+def _on_its_path(directory: Path | str, description: str) -> str:
+    """The warning's wording for ``directory`` on the file's path failing the check."""
+    return f"the directory {upstream_guard._logged_path(os.path.realpath(directory))} on its path is {description}"
+
+
+def _strictly_above(directory: str, below: str) -> bool:
+    return below != directory and below.startswith(directory.rstrip(os.sep) + os.sep)
+
+
+@pytest.fixture(autouse=True)
+def _trust_the_directories_above_tmp_path(
+    request: pytest.FixtureRequest, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Treat the directories above ``tmp_path`` as trusted, which a test cannot arrange for real.
+
+    Every directory on the allowlist file's path must be owned by the user or root and not writable by others, and ``tmp_path`` lives under the system's temporary directory: ``/tmp`` (sticky, world-writable) on Linux. So the check skips exactly the directories strictly above ``tmp_path``; ``tmp_path`` and everything a test makes inside it are judged for real. ``test_the_real_directories_above_tmp_path_are_judged`` opts out to check them as they are, and the ancestor rule itself is tested on fabricated ``lstat`` results.
+    """
+    if "real_ancestors" in request.fixturenames:
+        return
+    below = os.path.realpath(tmp_path)
+    real_problem = upstream_guard._directory_problem
+
+    def trusting_above(directories: list[str]) -> str | None:
+        return real_problem([d for d in directories if not _strictly_above(d, below)])
+
+    monkeypatch.setattr(upstream_guard, "_directory_problem", trusting_above)
+
+
+@pytest.fixture
 def allow_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     path = tmp_path / "allowed-base-urls"
     monkeypatch.setenv(FILE_ENV, str(path))
@@ -616,7 +649,7 @@ def test_a_file_in_a_group_writable_directory_is_refused_until_it_is_fixed(
     assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
-    assert "its directory is writable by group or others (mode 0770)" in warnings[0]
+    assert _on_its_path(shared, "writable by group or others (mode 0770)") in warnings[0]
 
 
 @_POSIX_USER
@@ -674,7 +707,7 @@ def test_a_symlink_planted_in_a_sticky_shared_directory_is_refused(
     finally:
         shared.chmod(0o700)
     (warning,) = [r.getMessage() for r in caplog.records]
-    assert "its directory is writable by group or others (mode 1777)" in warning
+    assert _on_its_path(shared, "writable by group or others (mode 1777)") in warning
 
 
 @_POSIX_USER
@@ -724,7 +757,10 @@ def test_a_hard_link_to_a_root_owned_file_in_another_user_s_directory_is_refused
 
     assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
     (warning,) = [r.getMessage() for r in caplog.records]
-    assert f"its directory is owned by uid {real_uid}, not by the user running the proxy" in warning
+    assert (
+        _on_its_path(tmp_path, f"owned by uid {real_uid}, not by the user running the proxy")
+        in warning
+    )
 
 
 @_POSIX_USER
@@ -773,10 +809,7 @@ def test_a_symlink_into_a_shared_directory_is_refused(
     finally:
         shared.chmod(0o700)
     (warning,) = [r.getMessage() for r in caplog.records]
-    assert (
-        "the directory of the file its symlink resolves to is writable by group or others (mode 0777)"
-        in warning
-    )
+    assert _on_its_path(shared, "writable by group or others (mode 0777)") in warning
 
     assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
 
@@ -798,7 +831,7 @@ def test_a_symlink_in_a_shared_directory_is_refused(
     finally:
         shared.chmod(0o700)
     (warning,) = [r.getMessage() for r in caplog.records]
-    assert "its directory is writable by group or others (mode 0777)" in warning
+    assert _on_its_path(shared, "writable by group or others (mode 0777)") in warning
 
 
 @_POSIX_USER
@@ -825,7 +858,9 @@ def test_a_cached_version_is_withheld_while_its_directory_is_unsafe(
     assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
     assert reads == []
     messages = [r.getMessage() for r in caplog.records]
-    assert len([m for m in messages if "its directory is writable by group or others" in m]) == 1
+    assert (
+        len([m for m in messages if _on_its_path(shared, "writable by group or others") in m]) == 1
+    )
     assert any(m.endswith("is usable again") for m in messages)
 
 
@@ -919,10 +954,7 @@ def test_a_symlink_chain_through_a_shared_directory_is_refused(
     finally:
         shared.chmod(0o700)
     (warning,) = [r.getMessage() for r in caplog.records]
-    assert (
-        "the directory of a symlink it passes through is writable by group or others (mode 0777)"
-        in warning
-    )
+    assert _on_its_path(shared, "writable by group or others (mode 0777)") in warning
 
     assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
 
@@ -938,8 +970,9 @@ def test_a_relative_symlink_hop_resolves_against_the_link_s_directory(
     monkeypatch.setenv(FILE_ENV, str(priv / "allow"))
 
     assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
-    directories = [d for d, _ in upstream_guard._allowlist_directories(str(priv / "allow"))]
-    assert directories == [os.path.realpath(priv), os.path.realpath(safe)]
+    directories = upstream_guard._path_directories(str(priv / "allow"))
+    assert directories[-2:] == [os.path.realpath(priv), os.path.realpath(safe)]
+    assert directories[0] == os.sep
 
 
 def test_a_symlink_chain_past_the_walk_limit_is_refused(
@@ -965,21 +998,192 @@ def test_a_cached_version_is_withheld_when_its_directory_cannot_be_stat_ed(
     _replace(allow_file, "http://127.0.0.1:4100")
     assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
     directory = os.path.realpath(allow_file.parent)
-    real_stat = os.stat
+    real_lstat = os.lstat
 
     def directory_unreachable(path: object, *args: object, **kwargs: object) -> os.stat_result:
         if os.fspath(path) == directory:  # type: ignore[arg-type]
             raise OSError(errno.EIO, os.strerror(errno.EIO), directory)
-        return real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+        return real_lstat(path, *args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(os, "stat", directory_unreachable)
+    monkeypatch.setattr(os, "lstat", directory_unreachable)
 
     assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
     (warning,) = [r.getMessage() for r in caplog.records]
-    assert "its directory: Input/output error (EIO)" in warning
+    assert (
+        f"the directory {upstream_guard._logged_path(directory)} on its path: Input/output error (EIO)"
+        in warning
+    )
 
-    monkeypatch.setattr(os, "stat", real_stat)
+    monkeypatch.setattr(os, "lstat", real_lstat)
     assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
+
+
+@_POSIX_USER
+def test_a_private_directory_under_a_world_writable_one_is_refused_before_and_after_a_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Review case A2: shared/ (0777) holds a private headroom/ (0700); anyone can rename it and link /etc in its place."""
+    caplog.set_level(logging.WARNING, logger="headroom.proxy.upstream_guard")
+    shared, etc_like = tmp_path / "shared", tmp_path / "etc-like"
+    shared.mkdir()
+    etc_like.mkdir(mode=0o700)
+    (etc_like / "allow").write_text("127.0.0.1\tlocalhost\n", encoding="utf-8", newline="\n")
+    (shared / "headroom").mkdir(mode=0o700)
+    _replace(shared / "headroom" / "allow", "http://127.0.0.1:4100")
+    monkeypatch.setenv(FILE_ENV, str(shared / "headroom" / "allow"))
+    shared.chmod(0o777)
+    try:
+        assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+        (shared / "headroom").rename(shared / "moved")
+        (shared / "headroom").symlink_to(etc_like)
+        assert is_safe_upstream_url("http://127.0.0.1:22/") is False
+        assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+    finally:
+        shared.chmod(0o700)
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings
+    assert all(
+        _on_its_path(shared, "writable by group or others (mode 0777)") in w for w in warnings
+    )
+
+
+@_POSIX_USER
+@pytest.mark.parametrize("shared_mode", [0o777, 0o755])
+def test_a_directory_symlink_in_the_middle_of_the_path_is_judged_where_it_lives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shared_mode: int
+) -> None:
+    """Review case B: shared/cfg -> safe1, path shared/cfg/allow.txt. Whoever writes shared/ can repoint cfg."""
+    shared, safe1, safe2 = tmp_path / "shared", tmp_path / "safe1", tmp_path / "safe2"
+    for directory in (shared, safe1, safe2):
+        directory.mkdir(mode=0o700)
+    _replace(safe1 / "allow.txt", "http://127.0.0.1:4100")
+    _replace(safe2 / "allow.txt", "http://127.0.0.1:4200")
+    (shared / "cfg").symlink_to(safe1)
+    monkeypatch.setenv(FILE_ENV, str(shared / "cfg" / "allow.txt"))
+    shared.chmod(shared_mode)
+    try:
+        first = is_safe_upstream_url("http://127.0.0.1:4100/v1")
+        (shared / "cfg").unlink()
+        (shared / "cfg").symlink_to(safe2)
+        second = is_safe_upstream_url("http://127.0.0.1:4200/v1")
+    finally:
+        shared.chmod(0o700)
+
+    # Only the user can have repointed the link when shared/ is theirs alone.
+    expected = shared_mode == 0o755
+    assert (first, second) == (expected, expected)
+
+
+@_POSIX_USER
+@pytest.mark.parametrize(("links", "admitted"), [(3, True), (4, False)])
+def test_the_symlink_limit_counts_every_link_followed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, links: int, admitted: bool
+) -> None:
+    monkeypatch.setattr(upstream_guard, "_MAX_SYMLINK_HOPS", 3)
+    _replace(tmp_path / "real", "http://127.0.0.1:4100")
+    target = tmp_path / "real"
+    for n in range(links):
+        link = tmp_path / f"link-{n}"
+        link.symlink_to(target)
+        target = link
+    monkeypatch.setenv(FILE_ENV, str(target))
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is admitted
+
+
+_ME, _ROOT, _OTHER = 1000, 0, 2000
+
+
+def _fabricated(uid: int, mode: int) -> os.stat_result:
+    return os.stat_result((stat.S_IFDIR | mode, 0, 0, 1, uid, 0, 0, 0, 0, 0))
+
+
+@pytest.mark.parametrize(
+    ("tree", "refused_at"),
+    [
+        (
+            {
+                "/": (_ROOT, 0o755),
+                "/home": (_ROOT, 0o755),
+                "/home/me": (_ME, 0o755),
+                "/home/me/cfg": (_ME, 0o700),
+            },
+            None,
+        ),
+        (
+            {"/": (_ROOT, 0o755), "/etc": (_ROOT, 0o755), "/etc/headroom": (_ROOT, 0o755)},
+            None,
+        ),
+        (
+            {"/": (_ROOT, 0o755), "/tmp": (_ROOT, 0o1777), "/tmp/mine": (_ME, 0o700)},
+            ("/tmp", "writable by group or others (mode 1777)"),
+        ),
+        (
+            {"/": (_ROOT, 0o755), "/srv": (_ROOT, 0o775), "/srv/headroom": (_ME, 0o700)},
+            ("/srv", "writable by group or others (mode 0775)"),
+        ),
+        (
+            {
+                "/": (_ROOT, 0o755),
+                "/home": (_ROOT, 0o755),
+                "/home/them": (_OTHER, 0o755),
+                "/home/them/cfg": (_ME, 0o700),
+            },
+            (
+                "/home/them",
+                "owned by uid 2000, not by the user running the proxy (uid 1000) or root",
+            ),
+        ),
+    ],
+    ids=["home", "root-controlled", "under-tmp", "group-writable-ancestor", "other-user-ancestor"],
+)
+def test_every_directory_on_the_path_must_be_trusted(
+    real_ancestors: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tree: dict[str, tuple[int, int]],
+    refused_at: tuple[str, str] | None,
+) -> None:
+    """The ancestor rule on fabricated ``lstat`` results, so it does not depend on this machine's /tmp."""
+    monkeypatch.setattr(os, "geteuid", lambda: _ME)
+    monkeypatch.setattr(os, "lstat", lambda path: _fabricated(*tree[os.fspath(path)]))
+
+    problem = upstream_guard._directory_problem(list(tree))
+
+    if refused_at is None:
+        assert problem is None
+    else:
+        directory, description = refused_at
+        assert (
+            problem
+            == f"the directory {upstream_guard._logged_path(directory)} on its path is {description}"
+        )
+
+
+@_POSIX_USER
+def test_the_real_directories_above_tmp_path_are_judged(
+    real_ancestors: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No scaffolding: whether the file is used depends on this machine's real directories above tmp_path."""
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    _replace(private / "allow", "http://127.0.0.1:4100")
+    monkeypatch.setenv(FILE_ENV, str(private / "allow"))
+    euid = os.geteuid()
+    above = []
+    directory = os.path.realpath(tmp_path)
+    while True:
+        above.append(directory)
+        parent = os.path.dirname(directory)
+        if parent == directory:
+            break
+        directory = parent
+    trusted = all(
+        os.lstat(d).st_uid in (euid, 0) and not os.lstat(d).st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        for d in above
+    )
+
+    # On Linux tmp_path is under /tmp (sticky, world-writable), so this expects a refusal there.
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is trusted
 
 
 def test_concurrent_checks_after_a_change_read_and_log_it_once(
