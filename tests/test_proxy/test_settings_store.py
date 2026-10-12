@@ -193,6 +193,42 @@ class TestNulCharacters:
         assert os.environ["HEADROOM_PORT"] == "9898"
 
 
+class TestBlankAllowlistFileOverride:
+    """``--allowed-base-urls-file ""`` exports an empty variable that switches the stored file off."""
+
+    @pytest.mark.parametrize("blank", ["", "   "])
+    def test_a_blank_variable_overrides_the_stored_path(self, workspace, monkeypatch, blank):
+        _clear_env(monkeypatch)
+        settings_store.save({"allowed_base_urls_file": "/run/headroom/allowed"})
+        monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS_FILE", blank)
+
+        assert settings_store.effective_values()["allowed_base_urls_file"] is None
+        schema = settings_store.to_schema()
+        field = next(f for f in schema["fields"] if f["key"] == "allowed_base_urls_file")
+        assert field["env_override"] is True
+        assert field["value"] is None
+        assert field["stored"] == "/run/headroom/allowed"
+
+    def test_an_unset_variable_shows_the_stored_path(self, workspace, monkeypatch):
+        _clear_env(monkeypatch)
+        settings_store.save({"allowed_base_urls_file": "/run/headroom/allowed"})
+
+        schema = settings_store.to_schema()
+        field = next(f for f in schema["fields"] if f["key"] == "allowed_base_urls_file")
+        assert field["env_override"] is False
+        assert field["value"] == "/run/headroom/allowed"
+
+    def test_other_fields_still_treat_a_blank_variable_as_unset(self, workspace, monkeypatch):
+        _clear_env(monkeypatch)
+        settings_store.save({"openai_base_url": "https://gw.example"})
+        monkeypatch.setenv("OPENAI_TARGET_API_URL", "")
+
+        schema = settings_store.to_schema()
+        field = next(f for f in schema["fields"] if f["key"] == "openai_base_url")
+        assert field["env_override"] is False
+        assert field["value"] == "https://gw.example"
+
+
 class TestEffectiveValues:
     def test_default_then_file_then_env(self, workspace, monkeypatch):
         _clear_env(monkeypatch)
