@@ -26,10 +26,11 @@ import socket
 import stat
 import sys
 import threading
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator, MutableMapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from types import FrameType
+from typing import Any
 
 from headroom.proxy.private_paths import foreign_write_access
 
@@ -226,6 +227,30 @@ def bind_unix_listener(path: str) -> UnixSocketListener:
         sock.close()
         raise
     return UnixSocketListener(path=path, sock=sock, device=bound.st_dev, inode=bound.st_ino)
+
+
+#: The client address a request on the unix socket listener is given. uvicorn reports no peer address for a unix socket, and every loopback guard fails closed on a missing one (``headroom.proxy.loopback_guard.is_loopback_host``). A peer on this listener is the proxy's own user, since the socket is ``0o600`` in a directory only that user can change, which is narrower than a loopback TCP peer (any local user), so it is given the loopback address those guards admit.
+SOCKET_PEER_ADDRESS = ("127.0.0.1", 0)
+
+
+class UnixSocketPeerMiddleware:
+    """ASGI middleware that gives a request with no peer address :data:`SOCKET_PEER_ADDRESS`.
+
+    Installed only by an app that listens on nothing but its unix socket (``ProxyConfig.uds``), so a missing address there always means a peer on that socket. Must be the outermost layer, so the token gate and every loopback guard see the address.
+    """
+
+    def __init__(self, app: Callable[..., Awaitable[None]]) -> None:
+        self.app = app
+
+    async def __call__(
+        self,
+        scope: MutableMapping[str, Any],
+        receive: Callable[..., Awaitable[Any]],
+        send: Callable[..., Awaitable[None]],
+    ) -> None:
+        if scope["type"] in ("http", "websocket") and scope.get("client") is None:
+            scope = {**scope, "client": SOCKET_PEER_ADDRESS}
+        await self.app(scope, receive, send)
 
 
 class _Terminated(BaseException):

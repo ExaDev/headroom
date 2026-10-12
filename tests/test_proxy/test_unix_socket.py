@@ -26,6 +26,7 @@ from headroom.cli.main import main  # noqa: E402
 from headroom.proxy.models import ProxyConfig  # noqa: E402
 from headroom.proxy.unix_socket import (  # noqa: E402
     SOCKET_MODE,
+    SOCKET_PEER_ADDRESS,
     UnixSocketInUseError,
     UnixSocketUnusableError,
     bind_unix_listener,
@@ -46,6 +47,7 @@ _SERVER_SCRIPT = textwrap.dedent(
     import headroom.proxy.server as server
     from headroom.proxy.loopback_guard import require_loopback
     from headroom.proxy.models import ProxyConfig
+    from headroom.proxy.unix_socket import UnixSocketPeerMiddleware
 
     app = FastAPI()
 
@@ -71,6 +73,8 @@ _SERVER_SCRIPT = textwrap.dedent(
                 sock.close()
         return {"sockets": found}
 
+    # As create_app installs it for a socket listener.
+    app.add_middleware(UnixSocketPeerMiddleware)
     server.create_app = lambda config: app
     server.run_server(ProxyConfig(uds=sys.argv[1]), print_banner=False)
     """
@@ -146,11 +150,11 @@ class TestServedOverUnixSocket:
         assert ["AF_UNIX", str(path)] in sockets
         assert [family for family, _ in sockets if family != "AF_UNIX"] == []
 
-    def test_debug_guard_admits_socket_peer_without_client_address(self, running_server):
+    def test_debug_guard_admits_socket_peer_given_the_loopback_address(self, running_server):
         path, _ = running_server
         response = _get(path, "/debug/peer")
         assert response.status_code == 200
-        assert response.json() == {"client": None}
+        assert response.json() == {"client": list(SOCKET_PEER_ADDRESS)}
 
     def test_socket_removed_on_clean_shutdown(self, running_server):
         path, proc = running_server
@@ -159,6 +163,49 @@ class TestServedOverUnixSocket:
         # The process still ends by the signal, as uvicorn's own re-raise makes it do over TCP.
         assert proc.returncode == -signal.SIGTERM, proc.communicate()
         assert not path.exists()
+
+
+@pytest.fixture
+def real_proxy(socket_dir: Path, tmp_path: Path):
+    """The real proxy app (``create_app``) served by ``python -m headroom.proxy.server --uds``."""
+    path = socket_dir / "proxy.sock"
+    env = {
+        **_env_without_tcp_listen_vars(),
+        "HEADROOM_WORKSPACE_DIR": str(tmp_path / "workspace"),
+        "HEADROOM_BEACON": "off",
+        "HEADROOM_TELEMETRY": "off",
+        "HEADROOM_UPDATE_CHECK": "off",
+    }
+    # The proxy logs every request to stderr, so a pipe nobody drains would fill and stall it; the log goes to a file, printed if the proxy never answers.
+    log_path = tmp_path / "proxy.log"
+    with log_path.open("w") as log:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "headroom.proxy.server", "--uds", str(path)],
+            cwd=REPO_ROOT,
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    try:
+        try:
+            _wait_for_socket(path, proc)
+        except AssertionError:
+            print(log_path.read_text())
+            raise
+        yield path
+    finally:
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGTERM)
+            proc.wait(timeout=30)
+
+
+class TestRealProxyOverUnixSocket:
+    def test_socket_peer_reaches_a_loopback_only_route(self, real_proxy: Path):
+        # A bare 404 would be the loopback guard refusing the peer; this body comes from the route itself.
+        response = _get(real_proxy, "/stats/sessions/unknown-session")
+        assert response.status_code == 404
+        assert response.json() == {"error": "session_not_found", "session_id": "unknown-session"}
 
 
 class TestBindUnixListener:

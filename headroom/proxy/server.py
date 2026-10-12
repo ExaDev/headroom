@@ -190,6 +190,7 @@ from headroom.proxy.tcp_keepalive import install_tcp_keepalive
 from headroom.proxy.tool_schema_savings_policy import tool_schema_saved_from_tags
 from headroom.proxy.unix_socket import (
     UnixSocketInUseError,
+    UnixSocketPeerMiddleware,
     UnixSocketUnusableError,
     checked_unix_socket_path,
     require_unix_sockets,
@@ -6195,6 +6196,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # Register last so this raw ASGI middleware is outermost and covers the
     # complete response body, including responses produced by other middleware.
     app.add_middleware(ActivityMiddleware, proxy=proxy)
+    if config.uds is not None:
+        # Outermost of all, so the token gate and every loopback guard see a socket peer's address (see UnixSocketPeerMiddleware).
+        app.add_middleware(UnixSocketPeerMiddleware)
 
     return app
 
@@ -6636,8 +6640,8 @@ def _run_uvicorn(
         # from X-Forwarded-For when FORWARDED_ALLOW_IPS is broader than the
         # default. Disabling proxy_headers here guarantees the guard sees the
         # real peer address regardless of env. Over a unix socket uvicorn
-        # reports no peer address, so request.client is None, which the
-        # guard treats as local: the socket's 0600 mode already limits
+        # reports no peer address, and UnixSocketPeerMiddleware gives the
+        # request a loopback one: the socket's 0600 mode already limits
         # peers to the proxy's own user.
         proxy_headers=False,
         timeout_graceful_shutdown=10,
