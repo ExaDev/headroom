@@ -367,17 +367,39 @@ def _directory_problem(directories: list[tuple[str, str]]) -> str | None:
     return None
 
 
+# The most symlinks walked while finding the directories that hold a path's chain: Linux's MAXSYMLINKS (40), the larger of the common kernels' limits (macOS's is 32). The kernel refuses a longer chain before this walk would see it, since the file is stat-ed first, so the limit only bounds the walk.
+_MAX_SYMLINK_HOPS = 40
+
+
+class _UnwalkableAllowlistPath(Exception):
+    """The path's chain of symlinks could not be walked to the file."""
+
+
 def _allowlist_directories(path: str) -> list[tuple[str, str]]:
     """The directories whose write access could replace the file ``path`` names, each with how to describe it.
 
-    The directory holding ``path`` itself, where whoever can write could replace the entry there, and, when that entry is a symlink (or a chain of them) to a file elsewhere, the directory holding the file it resolves to, where whoever can write could replace the file. Symlinks among the directories' own ancestors (``/tmp`` to ``/private/tmp`` on macOS) do not count as a second directory: both resolve to the same place, which is checked once.
+    Every hop counts: the directory holding ``path``, the directory holding each symlink the path passes through on the way to the file, and the directory holding the file. Whoever can write any of them could swap the entry there and so choose the file. Each directory is resolved (ancestor symlinks such as ``/tmp`` to ``/private/tmp`` followed) and checked once. Raises ``OSError`` when a link cannot be read and :class:`_UnwalkableAllowlistPath` past ``_MAX_SYMLINK_HOPS``.
     """
-    link_directory = os.path.dirname(path)
-    target_directory = os.path.dirname(os.path.realpath(path))
-    directories = [(link_directory, "its directory")]
-    if target_directory != os.path.realpath(link_directory):
-        directories.append((target_directory, "the directory of the file its symlink resolves to"))
-    return directories
+    directories: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    entry = path
+    for hop in range(_MAX_SYMLINK_HOPS + 1):
+        is_link = os.path.islink(entry)
+        if hop == 0:
+            which = "its directory"
+        elif is_link:
+            which = "the directory of a symlink it passes through"
+        else:
+            which = "the directory of the file its symlink resolves to"
+        directory = os.path.realpath(os.path.dirname(entry))
+        if directory not in seen:
+            seen.add(directory)
+            directories.append((directory, which))
+        if not is_link:
+            return directories
+        # An absolute target replaces the base; a relative one is relative to the link's own directory.
+        entry = os.path.join(os.path.dirname(entry), os.readlink(entry))
+    raise _UnwalkableAllowlistPath(f"its symlinks go more than {_MAX_SYMLINK_HOPS} deep")
 
 
 def _read_allowlist_file(path: str, st: os.stat_result) -> tuple[_FileIdentity, str]:
@@ -487,7 +509,14 @@ class _AllowlistFiles:
             cached = self._cached(path, identity)
             if cached is not None:
                 return self._serve(path, cached, file_env, env)
-            directories = _allowlist_directories(path)
+            try:
+                directories = _allowlist_directories(path)
+            except OSError as exc:
+                self._report(path, _os_error_reason(exc), file_env, env)
+                return None
+            except _UnwalkableAllowlistPath as exc:
+                self._report(path, str(exc), file_env, env)
+                return None
             problem = _directory_problem(directories)
             if problem is not None:
                 self._report(path, problem, file_env, env)
