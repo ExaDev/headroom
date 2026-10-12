@@ -476,32 +476,34 @@ def _path_directories(path: str) -> tuple[list[str], str | None]:
     return directories, final
 
 
-# How many times the walk is repeated when its final entry and the kernel's file differ. A replace landing between the two back-to-back lookups makes them differ once; a link the kernel follows by something other than its text (a /proc/<pid>/root magic link) makes them differ every time. Five consecutive races within a pair of adjacent syscalls is far past any real writer.
+# How many times the walk and read are repeated when they reach different files. A replace landing between two back-to-back lookups (the walk's final entry and the stat of the path, or that stat and the open) makes them differ once; a link the kernel follows by something other than its text (a /proc/<pid>/root magic link) makes them differ every time. Five consecutive races within a pair of adjacent syscalls is far past any real writer.
 _RESOLVE_ATTEMPTS = 5
 
 
-def _walk_agreeing_with_the_kernel(path: str) -> list[str]:
-    """The directories on ``path`` (:func:`_path_directories`), once the walk's final entry is the file the kernel resolves the path to.
+class _ResolvedElsewhere(Exception):
+    """Two lookups of the path reached different files: the walk and the kernel, or the stat and the open."""
 
-    Compares the device and inode of an ``lstat`` of the walk's final entry with a ``stat`` of ``path`` taken straight after it, repeating the walk up to ``_RESOLVE_ATTEMPTS`` times so that a replacement racing the two lookups is not mistaken for a disagreement. Raises :class:`_UnwalkableAllowlistPath` when they never agree, and ``OSError`` from either lookup.
+
+_RESOLVED_ELSEWHERE = "the path does not resolve to the file the permission check inspected"
+
+
+def _walk_once(path: str) -> tuple[list[str], os.stat_result]:
+    """The directories on ``path`` (:func:`_path_directories`) and the ``stat`` of the file the walk agrees the path reaches.
+
+    Compares the device and inode of an ``lstat`` of the walk's final entry with a ``stat`` of ``path`` taken straight after it. Raises :class:`_ResolvedElsewhere` when they differ, :class:`_UnwalkableAllowlistPath` from the walk and ``OSError`` from either lookup. The caller repeats it up to ``_RESOLVE_ATTEMPTS`` times.
     """
-    for _ in range(_RESOLVE_ATTEMPTS):
-        directories, final = _path_directories(path)
-        if final is None:
-            return directories
-        walked = os.lstat(final)
-        opened = os.stat(path)
-        if (walked.st_dev, walked.st_ino) == (opened.st_dev, opened.st_ino):
-            return directories
-    raise _UnwalkableAllowlistPath(
-        "the path does not resolve to the file the permission check inspected"
-    )
+    directories, final = _path_directories(path)
+    walked = None if final is None else os.lstat(final)
+    opened = os.stat(path)
+    if walked is not None and (walked.st_dev, walked.st_ino) != (opened.st_dev, opened.st_ino):
+        raise _ResolvedElsewhere(_RESOLVED_ELSEWHERE)
+    return directories, opened
 
 
 def _read_allowlist_file(path: str, st: os.stat_result) -> tuple[_FileIdentity, str]:
-    """Return the identity of the file read and its text; ``st`` is the caller's ``stat`` of it.
+    """Return the identity of the file read and its text; ``st`` is the ``stat`` the walk agreed on.
 
-    Raises :class:`_UnusableAllowlistFile` when it is not a regular file, cannot be opened or read, is larger than ``_MAX_ALLOWLIST_FILE_BYTES`` or is not UTF-8. The type is checked on ``st`` before anything is opened, so a device or terminal named by mistake is never opened, and again on the descriptor, for one swapped in after the ``stat``. The size is checked on the descriptor before anything is read.
+    Raises :class:`_UnusableAllowlistFile` when it is not a regular file, cannot be opened or read, is larger than ``_MAX_ALLOWLIST_FILE_BYTES`` or is not UTF-8. The type is checked on ``st`` before anything is opened, so a device or terminal named by mistake is never opened, and again on the descriptor, for one swapped in after the ``stat``. The size is checked on the descriptor before anything is read. The descriptor must be the file ``st`` describes (same device and inode); otherwise the open resolved the path to a different file from the one the walk inspected, and :class:`_ResolvedElsewhere` is raised for the caller to retry.
     """
     identity = _FileIdentity.of(st)
     if not stat.S_ISREG(st.st_mode):
@@ -512,7 +514,10 @@ def _read_allowlist_file(path: str, st: os.stat_result) -> tuple[_FileIdentity, 
     except OSError as exc:
         raise _UnusableAllowlistFile.from_os_error(exc, identity) from exc
     with os.fdopen(fd, "rb") as handle:
+        inspected = st
         st = os.fstat(handle.fileno())
+        if (st.st_dev, st.st_ino) != (inspected.st_dev, inspected.st_ino):
+            raise _ResolvedElsewhere(_RESOLVED_ELSEWHERE)
         # The identity recorded is the descriptor's, not the caller's `stat`'s. A rename between the two means the bytes read are the newer file's; filed under the older identity, the next check would see a mismatch and read the file again for nothing.
         identity = _FileIdentity.of(st)
         if not stat.S_ISREG(st.st_mode):
@@ -603,26 +608,36 @@ class _AllowlistFiles:
             cached = self._cached(path, identity)
             if cached is not None:
                 return self._serve(path, cached, file_env, env)
-            try:
-                directories = _walk_agreeing_with_the_kernel(path)
-            except OSError as exc:
-                self._report(path, _os_error_reason(exc), file_env, env)
+            for _ in range(_RESOLVE_ATTEMPTS):
+                try:
+                    directories, agreed = _walk_once(path)
+                except _ResolvedElsewhere:
+                    continue
+                except OSError as exc:
+                    self._report(path, _os_error_reason(exc), file_env, env)
+                    return None
+                except _UnwalkableAllowlistPath as exc:
+                    self._report(path, str(exc), file_env, env)
+                    return None
+                problem = _directory_problem(directories)
+                if problem is not None:
+                    self._report(path, problem, file_env, env)
+                    return None
+                try:
+                    read_identity, raw = _read_allowlist_file(path, agreed)
+                except _ResolvedElsewhere:
+                    continue
+                except _UnusableAllowlistFile as exc:
+                    if exc.lasting:
+                        with self._lock:
+                            self._loaded[path] = (exc.identity, None, directories)
+                    self._report(path, str(exc), file_env, env)
+                    return None
+                break
+            else:
+                self._report(path, _RESOLVED_ELSEWHERE, file_env, env)
                 return None
-            except _UnwalkableAllowlistPath as exc:
-                self._report(path, str(exc), file_env, env)
-                return None
-            problem = _directory_problem(directories)
-            if problem is not None:
-                self._report(path, problem, file_env, env)
-                return None
-            try:
-                identity, raw = _read_allowlist_file(path, st)
-            except _UnusableAllowlistFile as exc:
-                if exc.lasting:
-                    with self._lock:
-                        self._loaded[path] = (exc.identity, None, directories)
-                self._report(path, str(exc), file_env, env)
-                return None
+            identity = read_identity
             entries, skipped = _parse_destinations(raw, comments=True)
             with self._lock:
                 self._loaded[path] = (identity, entries, directories)
