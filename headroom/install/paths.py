@@ -40,6 +40,13 @@ def manifest_path(profile: str) -> Path:
     return profile_root(profile) / "manifest.json"
 
 
+def recovery_manifest_path(profile: str) -> Path:
+    """Return the inactive recovery snapshot path for a named profile."""
+
+    validated = validate_profile_name(profile)
+    return deploy_root() / f"{validated}.recovery.json"
+
+
 def log_path(profile: str) -> Path:
     """Return the log path used by persistent runner scripts."""
 
@@ -156,14 +163,16 @@ def opencode_config_path() -> Path:
     """Return the OpenCode config path.
 
     Resolves ``~/.config/opencode/opencode.json`` when ``OPENCODE_CONFIG``
-    is unset; otherwise the value of that environment variable. Checks for
+    is unset; otherwise the value of that environment variable. Honors
+    ``OPENCODE_HOME`` for the base directory, and checks for
     ``opencode.jsonc`` as well.
     """
 
     env_path = os.environ.get("OPENCODE_CONFIG", "").strip()
     if env_path:
         return Path(env_path).expanduser()
-    base_dir = Path.home() / ".config" / "opencode"
+    home_path = os.environ.get("OPENCODE_HOME", "").strip()
+    base_dir = Path(home_path).expanduser() if home_path else Path.home() / ".config" / "opencode"
     jsonc_path = base_dir / "opencode.jsonc"
 
     if jsonc_path.exists():

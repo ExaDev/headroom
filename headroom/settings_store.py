@@ -21,6 +21,7 @@ import logging
 import math
 import os
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -65,6 +66,20 @@ class SettingField:
 # the body-resolved HEADROOM_CODE_AWARE_ENABLED reader both accept).
 SETTINGS: tuple[SettingField, ...] = (
     # --- Compression ---
+    SettingField(
+        "HEADROOM_MODE",
+        "mode",
+        "Proxy mode",
+        "Compression",
+        "enum",
+        default="cache",
+        choices=("token", "cache"),
+        help=(
+            "Optimization posture: token rewrites history for maximum compression; "
+            "cache preserves prior turns for prefix-cache stability."
+        ),
+        tier="basic",
+    ),
     SettingField(
         "HEADROOM_SAVINGS_PROFILE",
         "savings_profile",
@@ -260,6 +275,21 @@ SETTINGS: tuple[SettingField, ...] = (
         maximum=65535,
         manifest_managed=True,
         help="Bind port. Managed by the install manifest on docker/service installs.",
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_UDS",
+        "uds",
+        "Unix socket path",
+        "Networking",
+        "str",
+        default=None,
+        manifest_managed=True,
+        help=(
+            "Serve on a Unix domain socket at this path instead of host/port. "
+            "POSIX only; leave empty to bind host/port. Managed by the install "
+            "manifest on docker/service installs."
+        ),
         tier="advanced",
     ),
     # --- Logging ---
@@ -576,6 +606,22 @@ SETTINGS: tuple[SettingField, ...] = (
             "On HTTP/1.1 this bounds the whole request body, so raise it if you push "
             "large bodies over a slow link. Lower it to fail over a dead pooled "
             "connection faster; the connect timeout only guards a fresh connect."
+        ),
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_UPSTREAM_TCP_KEEPALIVE_SECONDS",
+        "upstream_tcp_keepalive_seconds",
+        "Upstream TCP keepalive (s)",
+        "Timeouts",
+        "int",
+        default=None,
+        minimum=0,
+        help=(
+            "Seconds an upstream connection may sit silent before TCP keepalive "
+            "probes it. Default: 30, 0 disables. A link that dies without a reset "
+            "then fails over after about this + 60s instead of waiting out the "
+            "read timeout."
         ),
         tier="advanced",
     ),
@@ -984,17 +1030,67 @@ def save(values: dict[str, Any]) -> None:
     _atomic_write_text(paths.settings_path(), payload)
 
 
+#: Names the stored file supplied to this process's environment, with the value it supplied, as JSON. The leading underscore marks it as internal, as ``_HEADROOM_MALLOC_TUNED`` is, and keeps it out of the ``HEADROOM_`` variables the container install passes through. It lives in the environment rather than in module state because a child process (the macOS malloc-tuning re-exec, a supervised proxy started by ``headroom wrap``) inherits the variables themselves but starts with empty module state, and would otherwise judge an inherited stored value as an exported one.
+STORED_ENV_MARKER = "_HEADROOM_STORED_ENV"
+
+
+def _stored_env(env: Mapping[str, str] = os.environ) -> dict[str, str]:
+    """The marker's names and values in *env*, or an empty mapping when it is absent or unreadable."""
+    raw = env.get(STORED_ENV_MARKER)
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, RecursionError):
+        # Input nested deeper than the interpreter's parser allows raises RecursionError, which is not a ValueError; the depth at which it does varies by Python version.
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return {k: v for k, v in parsed.items() if isinstance(k, str) and isinstance(v, str)}
+
+
+def env_came_from_store(name: str, env: Mapping[str, str] = os.environ) -> bool:
+    """Whether *name* holds, in *env*, the value :func:`apply_to_environ` supplied rather than one exported or set since.
+
+    The value is compared as well as the name, so a variable the stored file once filled in and something later overwrote counts as set, not stored.
+    """
+    recorded = _stored_env(env).get(name)
+    return recorded is not None and env.get(name) == recorded
+
+
 def apply_to_environ(values: dict[str, Any]) -> None:
-    """``setdefault`` each stored value into ``os.environ`` (explicit export wins)."""
+    """``setdefault`` each stored value into ``os.environ`` (explicit export wins), recording what it supplied in :data:`STORED_ENV_MARKER`."""
+    supplied: dict[str, str] = {}
     for key, value in values.items():
         field = _BY_KEY.get(key)
         if field is None or value is None:
             continue
+        if field.env not in os.environ:
+            supplied[field.env] = _serialize(field, value)
         os.environ.setdefault(field.env, _serialize(field, value))
+    if supplied:
+        os.environ[STORED_ENV_MARKER] = json.dumps({**_stored_env(), **supplied}, sort_keys=True)
 
 
-def effective_values(stored: dict[str, Any] | None = None) -> dict[str, Any]:
-    """The value actually active now for each knob: default ← file ← environ."""
+def _coerce_runtime_values(runtime_values: dict[str, Any] | None) -> dict[str, Any]:
+    """Coerce known live-config values without exposing invalid internal state."""
+    result: dict[str, Any] = {}
+    for key, value in (runtime_values or {}).items():
+        field = _BY_KEY.get(key)
+        if field is None:
+            continue
+        try:
+            result[key] = _coerce(field, value)
+        except (ValueError, TypeError):
+            continue
+    return result
+
+
+def effective_values(
+    stored: dict[str, Any] | None = None,
+    runtime_values: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The active value for each knob: default ← file ← environ ← runtime."""
     if stored is None:
         stored = load()
     result: dict[str, Any] = {}
@@ -1009,6 +1105,7 @@ def effective_values(stored: dict[str, Any] | None = None) -> dict[str, Any]:
             except (ValueError, TypeError):
                 pass  # unparseable env: keep the file/default value
         result[field.key] = value
+    result.update(_coerce_runtime_values(runtime_values))
     return result
 
 
@@ -1031,14 +1128,26 @@ def stored_values(mask_secrets: bool = True) -> dict[str, Any]:
     return {key: _mask(_BY_KEY[key], value) for key, value in values.items()}
 
 
-def to_schema() -> dict[str, Any]:
+def to_schema(
+    *,
+    runtime_values: dict[str, Any] | None = None,
+    env_override_exclusions: set[str] | frozenset[str] = frozenset(),
+) -> dict[str, Any]:
     """Registry + grouped fields + effective values for the UI. Secrets masked.
 
     All curated knobs are startup-captured, so every key is restart-required;
     ``needs_restart_keys`` lists them for the UI's "restart to apply" banner.
+
+    ``runtime_values`` is the live ``ProxyConfig`` tier. It wins over values
+    re-read from ``os.environ``, which can contain profile defaults that were
+    seeded only after CLI options had already been resolved. Those generated
+    defaults belong in ``env_override_exclusions`` so they are not presented as
+    explicit operator exports.
     """
     stored = load()
-    effective = effective_values(stored)
+    environment_effective = effective_values(stored)
+    runtime = _coerce_runtime_values(runtime_values)
+    effective = {**environment_effective, **runtime}
     fields: list[dict[str, Any]] = []
     for field in SETTINGS:
         fields.append(
@@ -1056,8 +1165,13 @@ def to_schema() -> dict[str, Any]:
                 "minimum": field.minimum,
                 "maximum": field.maximum,
                 "tier": field.tier,
-                "env_override": bool(os.environ.get(field.env))
-                or _env_overrides_blank(field, os.environ.get(field.env)),
+                "env_override": (
+                    bool(os.environ.get(field.env))
+                    or _env_overrides_blank(field, os.environ.get(field.env))
+                )
+                and field.env not in env_override_exclusions,
+                "runtime_override": field.key in runtime
+                and runtime[field.key] != environment_effective[field.key],
                 "value": _mask(field, effective.get(field.key)),
                 "stored": _mask(field, stored.get(field.key)),
             }

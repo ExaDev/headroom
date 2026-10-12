@@ -12,7 +12,7 @@ Contract with the caller:
 
 * The parent directory must already exist and must be private to the user running the proxy: owned by the current effective uid and not writable by group or others (``0o700`` is the recommended mode). Whoever can write the directory can unlink the socket and bind their own at the same path, so this is checked, with a one-line error, before anything is bound; a sticky bit does not substitute for it (see :func:`_require_safe_parent`). This module never creates or chmods the directory; the socket's own ``0o600`` mode is the second layer, not the only one. Directories above the parent are not inspected.
 * A socket file left at the path by a process that has exited (nothing accepts connections on it) is removed and replaced. A socket that still accepts connections, or any path that is not a socket, is refused with :class:`UnixSocketInUseError`.
-* Checking for a stale socket and binding are two steps, so two proxies started on the same path at the same instant can race. Supervising a single proxy per path is the caller's job.
+* Checking for a stale socket and binding are two steps, so two proxies started on the same path at the same instant can still race; one started after the other has bound is refused. Supervising a single proxy per path is the caller's job.
 * On clean shutdown the socket file is removed, but only if the path still names the socket this process bound. That includes SIGTERM: uvicorn finishes its graceful shutdown and then re-raises the signal with the previous handler restored, which under the default handler would kill the process before any cleanup ran, so :func:`serving_unix_socket` installs a handler that unwinds the stack instead and re-raises SIGTERM itself once the file is gone.
 """
 
@@ -26,10 +26,11 @@ import socket
 import stat
 import sys
 import threading
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator, MutableMapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from types import FrameType
+from typing import Any
 
 from headroom.proxy.private_paths import foreign_write_access
 
@@ -46,19 +47,44 @@ class UnixSocketUnusableError(RuntimeError):
 
 
 def require_unix_sockets() -> None:
-    """Raise :class:`UnixSocketUnusableError` on a platform without ``socket.AF_UNIX``.
+    """Raise :class:`UnixSocketUnusableError` on a platform where the proxy cannot serve a unix socket.
 
-    Windows builds of Python define no ``AF_UNIX``, so ``--uds`` would otherwise die with an ``AttributeError`` the first time the socket module is asked for it. Entry points call this before doing any other work.
+    Windows builds of Python define no ``AF_UNIX``, so ``--uds`` would otherwise die with an ``AttributeError`` the first time the socket module is asked for it, and asyncio has no Windows unix socket transport even where the address family exists, so ``win32`` is refused outright. Entry points call this before doing any other work.
     """
-    if not hasattr(socket, "AF_UNIX"):
+    if sys.platform == "win32" or not hasattr(socket, "AF_UNIX"):
         raise UnixSocketUnusableError(
-            f"--uds needs unix domain sockets, which {sys.platform} does not provide"
+            f"--uds needs unix domain sockets, which {sys.platform} does not provide; "
+            "use --port instead"
         )
+
+
+# Docs page carrying the client-compatibility detail the banner has no room for.
+UDS_DOCS_URL = "https://headroom-docs.vercel.app/docs/proxy#serving-on-a-unix-socket"
+
+
+def socket_usage_lines(path: str | os.PathLike[str]) -> tuple[str, ...]:
+    """How the startup banner describes a socket bind, for every banner.
+
+    Deliberately names no agent and hands out no environment variables. An
+    earlier revision printed an ``ANTHROPIC_UNIX_SOCKET=... claude`` recipe here,
+    which is a configuration that does not work: it satisfies Claude Code's
+    ``api.anthropic.com`` host check but reclassifies the session as API-key
+    auth, and the session then fails to authenticate. Printing it at startup
+    turned a known-negative result into first-party guidance. The rule this
+    encodes is that the banner states a transport requirement and points at the
+    docs; per-client wiring belongs in the docs, where it can be qualified.
+    """
+    return (
+        f"  Socket:        {path}",
+        "  Client:        must support HTTP over a Unix socket natively",
+        f"  Example:       curl --unix-socket {path} http://localhost/health",
+        f"  Details:       {UDS_DOCS_URL}",
+    )
 
 
 @dataclass
 class UnixSocketListener:
-    """A bound, not yet listening, unix socket and the identity of the file it created."""
+    """A bound and listening unix socket, not yet handed to uvicorn, and the identity of the file it created."""
 
     path: str
     sock: socket.socket
@@ -188,7 +214,7 @@ def _remove_stale_socket(path: str) -> None:
 def bind_unix_listener(path: str) -> UnixSocketListener:
     """Bind a stream socket at *path* with mode :data:`SOCKET_MODE`.
 
-    The socket is chmodded before uvicorn calls ``listen()`` on it, so no peer can connect while the file still carries the umask-derived mode. The returned listener's ``path`` is the one resolved by :func:`checked_unix_socket_path`.
+    The socket is chmodded before it starts listening, so no peer can connect while the file still carries the umask-derived mode, and it is listening on return, so a second proxy started during this one's startup finds it in use rather than stale. The returned listener's ``path`` is the one resolved by :func:`checked_unix_socket_path`.
     """
     path = checked_unix_socket_path(path)
     _remove_stale_socket(path)
@@ -196,11 +222,37 @@ def bind_unix_listener(path: str) -> UnixSocketListener:
     try:
         sock.bind(path)
         os.chmod(path, SOCKET_MODE)
+        # Listening starts here, not when uvicorn gets the socket: until it is listening a connect is refused, which is what a stale socket looks like to `_remove_stale_socket`, so a second proxy started while this one is still starting up would delete this one's socket and bind its own. uvicorn's own `listen()` later only sets the backlog.
+        sock.listen(socket.SOMAXCONN)
         bound = os.lstat(path)
     except BaseException:
         sock.close()
         raise
     return UnixSocketListener(path=path, sock=sock, device=bound.st_dev, inode=bound.st_ino)
+
+
+#: The client address a request on the unix socket listener is given. uvicorn reports no peer address for a unix socket, and every loopback guard fails closed on a missing one (``headroom.proxy.loopback_guard.is_loopback_host``). A peer on this listener is the proxy's own user, since the socket is ``0o600`` in a directory only that user can change, which is narrower than a loopback TCP peer (any local user), so it is given the loopback address those guards admit.
+SOCKET_PEER_ADDRESS = ("127.0.0.1", 0)
+
+
+class UnixSocketPeerMiddleware:
+    """ASGI middleware that gives a request with no peer address :data:`SOCKET_PEER_ADDRESS`.
+
+    Installed only by an app that listens on nothing but its unix socket (``ProxyConfig.uds``), so a missing address there always means a peer on that socket. Must be the outermost layer, so the token gate and every loopback guard see the address.
+    """
+
+    def __init__(self, app: Callable[..., Awaitable[None]]) -> None:
+        self.app = app
+
+    async def __call__(
+        self,
+        scope: MutableMapping[str, Any],
+        receive: Callable[..., Awaitable[Any]],
+        send: Callable[..., Awaitable[None]],
+    ) -> None:
+        if scope["type"] in ("http", "websocket") and scope.get("client") is None:
+            scope = {**scope, "client": SOCKET_PEER_ADDRESS}
+        await self.app(scope, receive, send)
 
 
 class _Terminated(BaseException):

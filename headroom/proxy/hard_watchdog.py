@@ -61,16 +61,16 @@ def _resolve_secs() -> float:
 STDERR_FD = 2
 
 
-def _arm(secs: float) -> None:
+def _arm(secs: float, fd: int) -> None:
     # Re-arming replaces the previous timer, so a healthy interpreter never
     # lets it expire.
-    faulthandler.dump_traceback_later(secs, exit=True, file=STDERR_FD)
+    faulthandler.dump_traceback_later(secs, exit=True, file=fd)
 
 
-def _heartbeat(secs: float) -> None:
+def _heartbeat(secs: float, fd: int) -> None:
     while True:
         time.sleep(secs / 3.0)
-        _arm(secs)
+        _arm(secs, fd)
 
 
 def start_hard_watchdog() -> bool:
@@ -92,9 +92,10 @@ def start_hard_watchdog() -> bool:
     # First arm happens here, synchronously: the caller is covered from the
     # moment this returns, even if the very next call seizes the GIL before
     # the heartbeat thread gets scheduled.
-    _arm(secs)
+    fd = STDERR_FD
+    _arm(secs, fd)
     threading.Thread(
-        target=_heartbeat, args=(secs,), name="headroom-hard-watchdog", daemon=True
+        target=_heartbeat, args=(secs, fd), name="headroom-hard-watchdog", daemon=True
     ).start()
     logger.info(
         "Hard watchdog armed: dump all stacks and exit if the interpreter "

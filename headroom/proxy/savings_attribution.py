@@ -215,11 +215,20 @@ def public_tags(tags: MutableMapping[str, Any] | None) -> dict[str, Any]:
     session id (``session_policy.SESSION_TAG``) is a scalar but is stripped
     for the same reason from the other side: it is per-run plumbing, and a
     label store that treated it as a filter facet would cardinality-explode.
+
+    Credential-shaped keys are dropped here as well. :func:`helpers.extract_tags`
+    already refuses them at the source; this is the last gate before the
+    request log for tags a hook or extension added by hand.
     """
+    from headroom.proxy.internal_header_policy import is_credential_tag_key
     from headroom.proxy.session_policy import SESSION_TAG
 
     internal = _INTERNAL_TAGS | {SESSION_TAG}
-    return {key: value for key, value in (tags or {}).items() if key not in internal}
+    return {
+        key: value
+        for key, value in (tags or {}).items()
+        if key not in internal and not is_credential_tag_key(str(key))
+    }
 
 
 def encode(items: list[dict[str, Any]]) -> str:

@@ -21,8 +21,8 @@ permissions:
 
 jobs:
   no-manual-changelog:
-    # release-please's release PR is the sole author of CHANGELOG.md.
-    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
+    # release-please's release PR is the sole author of CHANGELOG.md, and a branch that merges upstream carries upstream's own changelog.
+    if: ${{ !startsWith(github.head_ref, 'release-please--') && !(startsWith(github.head_ref, 'reconcile/upstream-') && github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
     steps:
       - name: Reject manual CHANGELOG.md edits

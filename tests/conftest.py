@@ -20,6 +20,16 @@ from tests._skip_helpers import external_model_skip_reason
 
 
 @pytest.fixture(autouse=True)
+def _forget_stored_env_marker():
+    """Drop the record of which variables the stored settings supplied once a test ends.
+
+    ``apply_to_environ`` writes it into the process environment so a child process can read it, and a test that applies stored settings would otherwise leave it for the next one.
+    """
+    yield
+    os.environ.pop("_HEADROOM_STORED_ENV", None)
+
+
+@pytest.fixture(autouse=True)
 def _undo_process_trust_injection():
     """Undo ``truststore.inject_into_ssl()`` after any test that triggered it.
 
@@ -69,12 +79,17 @@ def _scrub_developer_headroom_env(monkeypatch, tmp_path):
         if key.startswith("HEADROOM_"):
             monkeypatch.delenv(key, raising=False)
     monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
-    # Scrubbing also drops the HEADROOM_HARD_WATCHDOG_SECS=0 that CI sets, and any app lifespan a test starts would then arm the production watchdog, which hard-exits the whole pytest process and erases its diagnostics. Tests of the watchdog set their own value.
-    monkeypatch.setenv("HEADROOM_HARD_WATCHDOG_SECS", "0")
+    # The stored-settings marker is an internal variable with a leading underscore, which the prefix scrub above does not reach, and a shell started under ``headroom wrap`` inherits it.
+    monkeypatch.delenv("_HEADROOM_STORED_ENV", raising=False)
     # Clearing HEADROOM_* alone leaves file-backed settings active. Give every
     # test its own store so proxy/CLI startup cannot load developer settings and
     # saves cannot rewrite them. Tests of path precedence can override this.
     monkeypatch.setenv("HEADROOM_SETTINGS_PATH", str(tmp_path / "headroom-settings.json"))
+    # The scrub also deletes the HEADROOM_HARD_WATCHDOG_SECS=0 opt-out CI sets
+    # (#3845), so every test that enters the proxy lifespan armed the 90s
+    # production watchdog inside pytest; it hard-exits the process with code 1
+    # and no summary. Tests of the watchdog set the variable themselves.
+    monkeypatch.setenv("HEADROOM_HARD_WATCHDOG_SECS", "0")
 
 
 # The scrub above deletes every HEADROOM_* var — which includes HEADROOM_BEACON,
@@ -247,13 +262,11 @@ def _null_binary_pins():
 def _reset_headroom_logger_propagation():
     """Keep `headroom.*` log records flowing to pytest's caplog handler.
 
-    Two sources disable propagation on the headroom logger tree and never
-    restore it, which then makes later `caplog`-based assertions flaky in
+    A benchmark helper disables propagation on the headroom logger tree and
+    never restores it, which then makes later `caplog`-based assertions flaky in
     full-suite runs (caplog attaches to root, so a `propagate=False` anywhere
     on the chain silently drops the records):
 
-    - ``headroom.proxy.helpers._setup_file_logging`` sets
-      ``getLogger("headroom").propagate = False`` on proxy startup.
     - ``benchmarks.claude_session_mode_benchmark._disable_headroom_benchmark_logging``
       (exercised by ``test_claude_session_mode_benchmark``) sets
       ``propagate = False`` + ``CRITICAL`` on ``headroom``, ``headroom.proxy``,

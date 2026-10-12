@@ -26,6 +26,7 @@ from headroom.cli.main import main  # noqa: E402
 from headroom.proxy.models import ProxyConfig  # noqa: E402
 from headroom.proxy.unix_socket import (  # noqa: E402
     SOCKET_MODE,
+    SOCKET_PEER_ADDRESS,
     UnixSocketInUseError,
     UnixSocketUnusableError,
     bind_unix_listener,
@@ -33,6 +34,7 @@ from headroom.proxy.unix_socket import (  # noqa: E402
     max_socket_path_bytes,
     require_unix_sockets,
 )
+from headroom.settings_store import env_came_from_store  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="needs AF_UNIX")
 
@@ -46,6 +48,7 @@ _SERVER_SCRIPT = textwrap.dedent(
     import headroom.proxy.server as server
     from headroom.proxy.loopback_guard import require_loopback
     from headroom.proxy.models import ProxyConfig
+    from headroom.proxy.unix_socket import UnixSocketPeerMiddleware
 
     app = FastAPI()
 
@@ -71,6 +74,8 @@ _SERVER_SCRIPT = textwrap.dedent(
                 sock.close()
         return {"sockets": found}
 
+    # As create_app installs it for a socket listener.
+    app.add_middleware(UnixSocketPeerMiddleware)
     server.create_app = lambda config: app
     server.run_server(ProxyConfig(uds=sys.argv[1]), print_banner=False)
     """
@@ -146,11 +151,11 @@ class TestServedOverUnixSocket:
         assert ["AF_UNIX", str(path)] in sockets
         assert [family for family, _ in sockets if family != "AF_UNIX"] == []
 
-    def test_debug_guard_admits_socket_peer_without_client_address(self, running_server):
+    def test_debug_guard_admits_socket_peer_given_the_loopback_address(self, running_server):
         path, _ = running_server
         response = _get(path, "/debug/peer")
         assert response.status_code == 200
-        assert response.json() == {"client": None}
+        assert response.json() == {"client": list(SOCKET_PEER_ADDRESS)}
 
     def test_socket_removed_on_clean_shutdown(self, running_server):
         path, proc = running_server
@@ -159,6 +164,57 @@ class TestServedOverUnixSocket:
         # The process still ends by the signal, as uvicorn's own re-raise makes it do over TCP.
         assert proc.returncode == -signal.SIGTERM, proc.communicate()
         assert not path.exists()
+
+
+@pytest.fixture
+def real_proxy(socket_dir: Path, tmp_path: Path):
+    """The real proxy app (``create_app``) served by ``python -m headroom.proxy.server --uds``."""
+    path = socket_dir / "proxy.sock"
+    env = {
+        **_env_without_tcp_listen_vars(),
+        "HEADROOM_WORKSPACE_DIR": str(tmp_path / "workspace"),
+        "HEADROOM_BEACON": "off",
+        "HEADROOM_TELEMETRY": "off",
+        "HEADROOM_UPDATE_CHECK": "off",
+    }
+    # The proxy logs every request to stderr, so a pipe nobody drains would fill and stall it; the log goes to a file, printed if the proxy never answers.
+    log_path = tmp_path / "proxy.log"
+    with log_path.open("w") as log:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "headroom.proxy.server", "--uds", str(path)],
+            cwd=REPO_ROOT,
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    try:
+        try:
+            _wait_for_socket(path, proc)
+        except AssertionError:
+            print(log_path.read_text())
+            raise
+        yield path
+    finally:
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGTERM)
+            proc.wait(timeout=30)
+
+
+class TestRealProxyOverUnixSocket:
+    def test_readyz_answers_on_the_socket(self, real_proxy: Path):
+        response = _get(real_proxy, "/readyz")
+        # Readiness itself depends on the environment (an unreachable upstream is not ready); what is under test is that the real app answers its probe on the socket.
+        assert response.status_code in (200, 503)
+        body = response.json()
+        assert body["service"] == "headroom-proxy"
+        assert isinstance(body["ready"], bool)
+
+    def test_socket_peer_reaches_a_loopback_only_route(self, real_proxy: Path):
+        # A bare 404 would be the loopback guard refusing the peer; this body comes from the route itself.
+        response = _get(real_proxy, "/stats/sessions/unknown-session")
+        assert response.status_code == 404
+        assert response.json() == {"error": "session_not_found", "session_id": "unknown-session"}
 
 
 class TestBindUnixListener:
@@ -192,6 +248,20 @@ class TestBindUnixListener:
             assert path.exists()
         finally:
             live.close()
+
+    def test_refuses_a_second_bind_while_the_first_is_still_starting(self, socket_dir: Path):
+        path = socket_dir / "proxy.sock"
+        first = bind_unix_listener(str(path))
+        try:
+            # The first proxy has bound and not handed its socket to uvicorn yet, which is the whole of its startup. A second one must find it in use, not stale.
+            with pytest.raises(UnixSocketInUseError, match="already listening"):
+                bind_unix_listener(str(path))
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.connect(str(path))
+                accepted, _ = first.sock.accept()
+                accepted.close()
+        finally:
+            first.close()
 
     def test_refuses_non_socket(self, socket_dir: Path):
         path = socket_dir / "proxy.sock"
@@ -307,6 +377,15 @@ class TestProxyConfigUds:
         with pytest.raises(ValueError, match="uds"):
             ProxyConfig(uds="")
 
+    def test_bind_policy_ignores_the_unused_host_of_a_socket_listener(self):
+        # A unix socket binds no interface, so a programmatic host cannot make it an open bind.
+        from headroom.proxy.bind_policy import evaluate_bind_policy
+
+        config = ProxyConfig(uds="/run/a/proxy.sock", host="0.0.0.0")
+        assert config.bind_policy_host is None
+        assert not evaluate_bind_policy(config.bind_policy_host, None, environ={}).refused
+        assert ProxyConfig(host="0.0.0.0").bind_policy_host == "0.0.0.0"
+
 
 class TestCliUdsFlag:
     def test_banner_and_config_use_the_resolved_path(self, socket_dir: Path, monkeypatch):
@@ -341,6 +420,72 @@ class TestCliUdsFlag:
         with patch("headroom.proxy.server.run_server", fake_run_server):
             result = CliRunner().invoke(main, ["proxy", *args], env=env or {})
         return result, captured.get("config")
+
+    def test_uds_from_the_environment_reaches_proxy_config(self, socket_dir: Path):
+        path = os.path.join(os.path.abspath(socket_dir), "proxy.sock")
+        result, config = self._invoke(
+            [], env={"HEADROOM_UDS": path, "HEADROOM_HOST": None, "HEADROOM_PORT": None}
+        )
+        assert result.exit_code == 0, result.output
+        assert config is not None
+        assert config.uds == path
+
+    def test_uds_from_the_environment_with_a_port_refused(self):
+        result, config = self._invoke(
+            [], env={"HEADROOM_UDS": "/run/x/proxy.sock", "HEADROOM_PORT": "9000"}
+        )
+        assert result.exit_code == 2
+        assert "--uds cannot be combined with --port" in result.output
+        assert config is None
+
+    def test_a_stored_port_does_not_block_uds(self, socket_dir: Path, monkeypatch):
+        from headroom import settings_store
+
+        path = os.path.join(os.path.abspath(socket_dir), "proxy.sock")
+        # setenv then delenv, so monkeypatch restores the variable's absence when the stored value is applied.
+        for name in ("HEADROOM_PORT", "HEADROOM_HOST"):
+            monkeypatch.setenv(name, "x")
+            monkeypatch.delenv(name)
+        monkeypatch.setattr(settings_store, "load", lambda: {"port": 9123})
+        result, config = self._invoke(["--uds", path])
+        assert result.exit_code == 0, result.output
+        assert config is not None
+        assert config.uds == path
+
+    def test_a_stored_port_inherited_by_a_re_executed_process_does_not_block_uds(
+        self, socket_dir: Path
+    ):
+        # The macOS malloc-tuning re-exec starts a new interpreter with the same environment and empty module state, so provenance has to arrive in the environment itself.
+        path = os.path.join(os.path.abspath(socket_dir), "proxy.sock")
+        result, config = self._invoke(
+            ["--uds", path],
+            env={
+                "HEADROOM_PORT": "9123",
+                "HEADROOM_HOST": None,
+                "_HEADROOM_STORED_ENV": '{"HEADROOM_PORT": "9123"}',
+            },
+        )
+        assert result.exit_code == 0, result.output
+        assert config is not None
+        assert config.uds == path
+
+    def test_a_port_exported_over_a_stored_one_blocks_uds(self):
+        result, config = self._invoke(
+            ["--uds", "/run/x/proxy.sock"],
+            env={"HEADROOM_PORT": "9000", "_HEADROOM_STORED_ENV": '{"HEADROOM_PORT": "9123"}'},
+        )
+        assert result.exit_code == 2
+        assert "--uds cannot be combined with --port" in result.output
+        assert config is None
+
+    def test_an_exported_port_still_blocks_uds_beside_a_stored_one(self, monkeypatch):
+        from headroom import settings_store
+
+        monkeypatch.setattr(settings_store, "load", lambda: {"port": 9123})
+        result, config = self._invoke(["--uds", "/run/x/proxy.sock"], env={"HEADROOM_PORT": "9000"})
+        assert result.exit_code == 2
+        assert "--uds cannot be combined with --port" in result.output
+        assert config is None
 
     def test_uds_reaches_proxy_config(self, socket_dir: Path):
         path = os.path.join(os.path.abspath(socket_dir), "proxy.sock")
@@ -503,3 +648,34 @@ class TestPlatformWithoutUnixSockets:
         )
         assert proc.returncode == 1
         assert proc.stderr.strip().startswith("error: --uds needs unix domain sockets")
+
+
+class TestStoredEnvMarker:
+    def test_a_marker_nested_past_the_recursion_limit_is_treated_as_absent(self):
+        # Closed, so a parser that reads the whole input must recurse: it raises RecursionError on every supported Python, where an unclosed input fails early on some.
+        depth = 1_000_000
+        env = {
+            "HEADROOM_PORT": "9123",
+            "_HEADROOM_STORED_ENV": "[" * depth + "]" * depth,
+        }
+        assert not env_came_from_store("HEADROOM_PORT", env)
+
+    @pytest.mark.parametrize("marker", ["not json", "[]", '{"HEADROOM_PORT": 9123}', "null"])
+    def test_an_unreadable_marker_never_makes_a_port_look_stored(self, marker: str):
+        env = {"HEADROOM_PORT": "9123", "_HEADROOM_STORED_ENV": marker}
+        assert not env_came_from_store("HEADROOM_PORT", env)
+
+    def test_the_module_entry_point_admits_a_port_only_the_store_supplied(self):
+        from headroom.proxy.server import _refuse_tcp_env_with_uds
+
+        _refuse_tcp_env_with_uds(
+            {"HEADROOM_PORT": "9123", "_HEADROOM_STORED_ENV": '{"HEADROOM_PORT": "9123"}'}
+        )
+
+    def test_the_module_entry_point_still_refuses_an_exported_port(self):
+        from headroom.proxy.server import _refuse_tcp_env_with_uds
+
+        with pytest.raises(SystemExit):
+            _refuse_tcp_env_with_uds(
+                {"HEADROOM_PORT": "9000", "_HEADROOM_STORED_ENV": '{"HEADROOM_PORT": "9123"}'}
+            )

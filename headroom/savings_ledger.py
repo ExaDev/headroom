@@ -317,6 +317,9 @@ def record_savings_event(
     zero-saving request is skipped exactly as before.
     """
 
+    if _paths.process_is_stateless():
+        return False
+
     try:
         before = max(int(tokens_before), 0)
         after = max(int(tokens_after), 0)
@@ -410,6 +413,8 @@ def record_savings_event(
             if cost_usd is None:
                 event["cost_usd"] = round(list_usd, 6)
 
+    if not _paths.persistence_allowed("savings ledger"):
+        return False
     target = _resolve_path(path)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)

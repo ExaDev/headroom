@@ -2,9 +2,10 @@
 
 import logging
 import os
+import platform
 import sys
 import warnings
-from importlib import import_module
+from importlib.util import find_spec
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -21,6 +22,15 @@ from headroom.proxy.modes import PROXY_MODE_CACHE, normalize_proxy_mode
 from .main import main
 
 
+def _proxy_requires_onnx_backends() -> bool:
+    """Match extras that omit unavailable Intel macOS Python 3.14+ wheels."""
+    return not (
+        sys.platform == "darwin"
+        and platform.machine() == "x86_64"
+        and sys.version_info[:2] >= (3, 14)
+    )
+
+
 def ensure_proxy_dependencies() -> None:
     """Verify optional proxy extras are installed before starting or wrapping."""
     required_modules: list[str] = [
@@ -29,18 +39,19 @@ def ensure_proxy_dependencies() -> None:
         "httpx",
         "openai",
         "mcp",
-        "magika",
         "zstandard",
         "websockets",
-        "onnxruntime",
         "transformers",
     ]
+    if _proxy_requires_onnx_backends():
+        required_modules.extend(["magika", "onnxruntime"])
     if sys.implementation.name != "pypy":
         required_modules.append("orjson")
 
     try:
-        for module in required_modules:
-            import_module(module)
+        missing = next((module for module in required_modules if find_spec(module) is None), None)
+        if missing is not None:
+            raise ImportError(f"No module named '{missing}'")
     except ImportError as e:
         click.secho(
             "Error: Proxy dependencies not installed. Run: pip install headroom-ai[proxy]",
@@ -184,25 +195,25 @@ def _get_env_int(name: str, default: int) -> int:
     return default if value is None else value
 
 
-def _get_env_float_optional(name: str) -> float | None:
-    val = os.environ.get(name)
-    if val is None or val == "":
-        return None
-    try:
-        return float(val)
-    except ValueError:
-        raise click.ClickException(f"{name} must be a number, got {val!r}") from None
-
-
 def _refuse_tcp_listen_options_with_uds(ctx: click.Context) -> None:
     """Reject ``--host``/``--port`` (from the command line or environment) alongside ``--uds``.
 
-    A unix socket listener binds no TCP address, so either value would be silently ignored.
+    A unix socket listener binds no TCP address, so either value would be silently ignored. A host or port that only a stored setting supplied is not a request for a TCP listener, so it is not refused: otherwise one dashboard-saved port would stop every supervised ``--uds`` start.
     """
-    explicit = {click.core.ParameterSource.COMMANDLINE, click.core.ParameterSource.ENVIRONMENT}
-    conflicting = [
-        f"--{name}" for name in ("host", "port") if ctx.get_parameter_source(name) in explicit
-    ]
+    from headroom import settings_store
+
+    env_names = {"host": "HEADROOM_HOST", "port": "HEADROOM_PORT"}
+
+    def explicit(name: str) -> bool:
+        source = ctx.get_parameter_source(name)
+        if source == click.core.ParameterSource.COMMANDLINE:
+            return True
+        return (
+            source == click.core.ParameterSource.ENVIRONMENT
+            and not settings_store.env_came_from_store(env_names[name])
+        )
+
+    conflicting = [f"--{name}" for name in ("host", "port") if explicit(name)]
     if conflicting:
         raise click.UsageError(
             f"--uds cannot be combined with {', '.join(conflicting)} "
@@ -238,10 +249,36 @@ def dashboard(port: int, no_open: bool) -> None:
 
 @main.command()
 @click.option(
+    "--headroom-deployment-profile",
+    hidden=True,
+    expose_value=False,
+    help="Internal persistent-deployment identity marker.",
+)
+@click.option(
+    "--headroom-deployment-runtime",
+    hidden=True,
+    expose_value=False,
+    help="Internal persistent-deployment identity marker.",
+)
+@click.option(
     "--host",
     default="127.0.0.1",
     envvar="HEADROOM_HOST",
     help="Host to bind to (default: 127.0.0.1, env: HEADROOM_HOST)",
+)
+@click.option(
+    "--uds",
+    default=None,
+    envvar="HEADROOM_UDS",
+    metavar="PATH",
+    type=click.Path(dir_okay=False, resolve_path=False),
+    help=(
+        "Listen on this unix domain socket path instead of a TCP host and port. "
+        "POSIX only. Cannot be combined with --host/--port or HEADROOM_HOST/HEADROOM_PORT. "
+        "The parent directory must already exist and be private (mode 0700); "
+        "the socket is created with mode 0600, a stale socket at the path is "
+        "replaced, and the socket is removed on shutdown (env: HEADROOM_UDS)."
+    ),
 )
 @click.option(
     "--port",
@@ -250,18 +287,6 @@ def dashboard(port: int, no_open: bool) -> None:
     type=click.IntRange(1, 65535),
     envvar="HEADROOM_PORT",
     help="Port to bind to (default: 8787, env: HEADROOM_PORT)",
-)
-@click.option(
-    "--uds",
-    default=None,
-    type=click.Path(dir_okay=False, resolve_path=False),
-    help=(
-        "Listen on this unix domain socket path instead of a TCP host and port. "
-        "Cannot be combined with --host/--port or HEADROOM_HOST/HEADROOM_PORT. "
-        "The parent directory must already exist and be private (mode 0700); "
-        "the socket is created with mode 0600, a stale socket at the path is "
-        "replaced, and the socket is removed on shutdown."
-    ),
 )
 @click.option(
     "--allowed-base-urls-file",
@@ -569,6 +594,18 @@ def dashboard(port: int, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--upstream-tcp-keepalive-seconds",
+    type=click.IntRange(min=0),
+    default=None,
+    envvar="HEADROOM_UPSTREAM_TCP_KEEPALIVE_SECONDS",
+    help=(
+        "Seconds an upstream connection may sit silent before TCP keepalive "
+        "probes it (default: 30, 0 disables). A link that dies without a reset "
+        "then fails over after about this + 60s instead of waiting out the read "
+        "timeout. Env: HEADROOM_UPSTREAM_TCP_KEEPALIVE_SECONDS."
+    ),
+)
+@click.option(
     "--anthropic-buffered-request-timeout-seconds",
     type=click.IntRange(min=1),
     default=None,
@@ -777,9 +814,9 @@ def dashboard(port: int, no_open: bool) -> None:
     envvar="HEADROOM_READ_MATURATION",
     help=(
         "EXPERIMENTAL: activity-based read maturation — hold fresh Reads "
-        "out of the provider prefix cache and compress them once their "
-        "file quiesces. Requires HEADROOM_ROLLOUT_CHANNEL=beta (or dev); "
-        "env: HEADROOM_READ_MATURATION=1."
+        "verbatim and compress them once their file quiesces, unless the "
+        "provider cache already holds them. Requires "
+        "HEADROOM_ROLLOUT_CHANNEL=beta (or dev); env: HEADROOM_READ_MATURATION=1."
     ),
 )
 @click.option(
@@ -1068,8 +1105,8 @@ def proxy(
     mode: str | None,
     target_ratio: float | None,
     host: str,
-    port: int,
     uds: str | None,
+    port: int,
     allowed_base_urls_file: str | None,
     workers: int,
     limit_concurrency: int,
@@ -1099,6 +1136,7 @@ def proxy(
     request_timeout_seconds: int | None,
     connect_timeout_seconds: int | None,
     write_timeout_seconds: int | None,
+    upstream_tcp_keepalive_seconds: int | None,
     anthropic_buffered_request_timeout_seconds: int | None,
     anthropic_pre_upstream_concurrency: int | None,
     anthropic_pre_upstream_acquire_timeout_seconds: float | None,
@@ -1186,11 +1224,13 @@ def proxy(
             raise click.ClickException(str(exc)) from None
 
     _reexec_with_malloc_tuning()
+
     ensure_proxy_dependencies()
 
     # Import here to avoid slow startup
     from headroom.proxy.server import (
         ProxyConfig,
+        _get_env_optional_bool,
         _parse_csv_tools,
         _parse_exclude_tools,
         _parse_tool_profiles,
@@ -1344,12 +1384,20 @@ def proxy(
             _paths.codex_wire_debug_dir()
         )
 
-    # Stateless mode: suppress TOIN filesystem persistence
+    # Stateless mode: suppress TOIN filesystem persistence, and export the flag
+    # so code that runs before the proxy records it (the update check) and
+    # child processes see the same answer as paths.process_is_stateless().
     if is_stateless:
         os.environ["HEADROOM_TOIN_BACKEND"] = "none"
+        os.environ["HEADROOM_STATELESS"] = "1"
 
-    # License key for managed/enterprise deployments (optional)
-    license_key = os.environ.get("HEADROOM_LICENSE_KEY")
+    # Licence token (HEADROOM_LICENSE; HEADROOM_LICENSE_KEY is a deprecated
+    # alias). Having one set never enables outbound usage reporting: that
+    # needs the explicit HEADROOM_USAGE_REPORTING=1 opt-in.
+    from headroom.license_env import resolve_license_token, usage_reporting_enabled
+
+    license_key = resolve_license_token()
+    usage_reporting = usage_reporting_enabled()
 
     # Qdrant connection for the qdrant-neo4j backend. CLI flags default
     # to None; when omitted we let ProxyConfig's default_factory resolve
@@ -1412,7 +1460,8 @@ def proxy(
         rate_limit_enabled=not no_rate_limit,
         rate_limit_requests_per_minute=rpm if rpm is not None else 60,
         rate_limit_tokens_per_minute=tpm,
-        compress_user_messages=_get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),
+        # Same parse as the server entry points: empty means unset (profile).
+        compress_user_messages=_get_env_optional_bool("HEADROOM_COMPRESS_USER_MESSAGES"),
         periodic_malloc_trim_enabled=_get_env_bool(
             "HEADROOM_MALLOC_TRIM", default_periodic_malloc_trim()
         ),
@@ -1478,6 +1527,9 @@ def proxy(
         if connect_timeout_seconds is not None
         else 10,
         write_timeout_seconds=write_timeout_seconds if write_timeout_seconds is not None else 150,
+        upstream_tcp_keepalive_seconds=(
+            upstream_tcp_keepalive_seconds if upstream_tcp_keepalive_seconds is not None else 30
+        ),
         anthropic_buffered_request_timeout_seconds=(
             anthropic_buffered_request_timeout_seconds
             if anthropic_buffered_request_timeout_seconds is not None
@@ -1549,6 +1601,7 @@ def proxy(
         anyllm_provider=effective_anyllm_provider,
         # License / Usage Reporting (managed/enterprise)
         license_key=license_key,
+        usage_reporting=usage_reporting,
         # Stateless mode: disable all filesystem writes
         stateless=is_stateless,
         # Unit 4: bounded pre-upstream concurrency on the Anthropic HTTP
@@ -1574,22 +1627,21 @@ def proxy(
     if config.memory_enabled:
         memory_status = "ENABLED (multi-provider)"
 
-    license_status = "OSS (no license key)"
+    license_status = "OSS (no licence)"
     if license_key:
-        license_status = f"MANAGED (key={license_key[:8]}...)"
+        # Never print licence material, not even a prefix.
+        if not usage_reporting:
+            reporting = "off"
+        elif config.offline:
+            reporting = "suppressed by HEADROOM_OFFLINE"
+        else:
+            reporting = "ON"
+        license_status = f"LICENSED (usage reporting {reporting})"
 
-    if config.uds is not None:
-        # HTTP clients reach a unix socket listener with any Host; the URL is only the request target.
-        listen_url = "http://localhost"
-        listen_display = f"unix:{config.uds}"
-        usage_lines = f"  curl:          curl --unix-socket {config.uds} {listen_url}/health"
-    else:
-        listen_url = f"http://{config.host}:{config.port}"
-        listen_display = listen_url
-        usage_lines = (
-            f"  Claude Code:   ANTHROPIC_BASE_URL={listen_url} claude\n"
-            f"  Codex / OpenAI: OPENAI_BASE_URL={listen_url}/v1 your-app"
-        )
+    # HTTP clients reach a unix socket listener with any Host; the URL is only the request target.
+    listen_url = (
+        "http://localhost" if config.uds is not None else f"http://{config.host}:{config.port}"
+    )
 
     provider_api_targets = resolve_api_targets(config.provider_api_overrides)
     anthropic_url = provider_api_targets.anthropic
@@ -1706,23 +1758,35 @@ Memory (Multi-Provider):
             f"(available: {','.join(_ext_available)})"
         )
 
-    # Security posture line: inbound auth token + air-gap mode, and a loud
-    # flag for the open-bind case (non-loopback host with no token).
-    from headroom.proxy.loopback_guard import is_loopback_host
+    # Security posture line: inbound auth token + air-gap mode. An open bind
+    # (non-loopback host, no token) is refused here, before the banner, unless
+    # the operator acknowledged it explicitly; see headroom/proxy/bind_policy.py.
+    from headroom.proxy.bind_policy import OPEN_BIND_ACK_ENV, evaluate_bind_policy
 
-    _auth_on = bool(config.proxy_token or os.environ.get("HEADROOM_PROXY_TOKEN"))
+    _bind = evaluate_bind_policy(config.bind_policy_host, config.proxy_token)
+    if _bind.refused:
+        raise click.ClickException(_bind.message())
+    _auth_on = _bind.token_configured
+    _open_bind_note = (
+        f" · WARNING open bind, /v1/* UNAUTHENTICATED (acknowledged via {OPEN_BIND_ACK_ENV}=1)"
+        if _bind.open_bind
+        else ""
+    )
     if config.offline:
-        _security_status = "OFFLINE (all egress disabled)" + (
-            " · inbound token REQUIRED (non-loopback)" if _auth_on else ""
+        # Offline masks nothing: an acknowledged open bind is still an open bind.
+        _security_status = (
+            "OFFLINE (all egress disabled)"
+            + (" · inbound token REQUIRED (non-loopback)" if _auth_on else "")
+            + _open_bind_note
         )
     elif _auth_on:
         _security_status = "inbound token REQUIRED for non-loopback callers"
     elif config.uds is not None:
         _security_status = "unix socket (peers limited by filesystem permissions)"
-    elif not is_loopback_host(config.host):
+    elif _bind.open_bind:
         _security_status = (
             "WARNING non-loopback bind with NO token — /v1/* is UNAUTHENTICATED "
-            "(set HEADROOM_PROXY_TOKEN)"
+            f"(acknowledged via {OPEN_BIND_ACK_ENV}=1; set HEADROOM_PROXY_TOKEN instead)"
         )
     else:
         _security_status = "loopback-only (no inbound token)"
@@ -1747,6 +1811,22 @@ Memory (Multi-Provider):
         tuning_section = "\nPerformance Tuning:\n" + "\n".join(_tuning_lines)
     else:
         tuning_section = ""
+
+    # A socket has no URL, and no per-agent recipe belongs here — see
+    # unix_socket.socket_usage_lines() for why the banner stays transport-neutral.
+    if config.uds is not None:
+        from headroom.proxy.unix_socket import socket_usage_lines
+
+        listen_display = f"unix:{config.uds}"
+        usage_section = "\n".join(socket_usage_lines(config.uds))
+    else:
+        listen_display = listen_url
+        usage_section = "\n".join(
+            (
+                f"  Claude Code:   ANTHROPIC_BASE_URL={listen_url} claude",
+                f"  Codex / OpenAI: OPENAI_BASE_URL={listen_url}/v1 your-app",
+            )
+        )
 
     click.echo(f"""
 ╔═══════════════════════════════════════════════════════════════════════╗
@@ -1777,7 +1857,7 @@ Routing:
   /v1/projects/.../publishers/... → {vertex_url}
 
 Usage:
-{usage_lines}
+{usage_section}
 {memory_section}
 Endpoints:
   GET  /livez      Process liveness
