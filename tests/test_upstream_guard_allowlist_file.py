@@ -622,7 +622,9 @@ def test_a_group_writable_file_is_refused(
     assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
     assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
     (warning,) = [r.getMessage() for r in caplog.records]
-    assert "the file is writable by group or others (mode 0620)" in warning
+    assert (
+        "the file is writable by group or others (mode 0620). Run chmod go-w on the file" in warning
+    )
 
     allow_file.chmod(0o600)
     assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
@@ -650,6 +652,9 @@ def test_a_file_in_a_group_writable_directory_is_refused_until_it_is_fixed(
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
     assert _on_its_path(shared, "writable by group or others (mode 0770)") in warnings[0]
+    assert (
+        f"Run chmod go-w on {upstream_guard._logged_path(os.path.realpath(shared))}" in warnings[0]
+    )
 
 
 @_POSIX_USER
@@ -1154,10 +1159,15 @@ def test_every_directory_on_the_path_must_be_trusted(
         assert problem is None
     else:
         directory, description = refused_at
-        assert (
-            problem
-            == f"the directory {upstream_guard._logged_path(directory)} on its path is {description}"
-        )
+        logged = upstream_guard._logged_path(directory)
+        if description.startswith("owned by"):
+            remedy = (
+                f"Make {logged} owned by uid {_ME} or root (chown), or keep the allowlist file "
+                "where every directory on its path is"
+            )
+        else:
+            remedy = f"Run chmod go-w on {logged}"
+        assert problem == f"the directory {logged} on its path is {description}. {remedy}"
 
 
 @_POSIX_USER

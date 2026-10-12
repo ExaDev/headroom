@@ -107,7 +107,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
-from headroom.proxy.private_paths import foreign_write_access
+from headroom.proxy.private_paths import ForeignWriteAccess, foreign_write_access
 
 logger = logging.getLogger(__name__)
 
@@ -352,6 +352,16 @@ class _UnusableAllowlistFile(Exception):
         return cls(_os_error_reason(exc), identity, lasting=exc.errno in _FILE_ERRNOS)
 
 
+def _remedy(problem: ForeignWriteAccess, subject: str) -> str:
+    """What the operator can do about ``problem`` with ``subject``, for the refusal's log line."""
+    if problem.other_owner:
+        return (
+            f"Make {subject} owned by uid {os.geteuid()} or root (chown), or keep the allowlist "
+            "file where every directory on its path is"
+        )
+    return f"Run chmod go-w on {subject}"
+
+
 def _require_private_file(st: os.stat_result, identity: _FileIdentity) -> None:
     """Raise :class:`_UnusableAllowlistFile` if a user other than this one or root could change the file itself.
 
@@ -361,7 +371,9 @@ def _require_private_file(st: os.stat_result, identity: _FileIdentity) -> None:
         return
     problem = foreign_write_access(st, root_may_own=True)
     if problem is not None:
-        raise _UnusableAllowlistFile(f"the file is {problem.description}", identity)
+        raise _UnusableAllowlistFile(
+            f"the file is {problem.description}. {_remedy(problem, 'the file')}", identity
+        )
 
 
 def _directory_problem(directories: list[str]) -> str | None:
@@ -380,7 +392,10 @@ def _directory_problem(directories: list[str]) -> str | None:
             return f"{_logged_path(directory)} on its path is no longer a directory"
         problem = foreign_write_access(info, root_may_own=True)
         if problem is not None:
-            return f"the directory {_logged_path(directory)} on its path is {problem.description}"
+            return (
+                f"the directory {_logged_path(directory)} on its path is {problem.description}."
+                f" {_remedy(problem, _logged_path(directory))}"
+            )
     return None
 
 
