@@ -1029,24 +1029,45 @@ def save(values: dict[str, Any]) -> None:
     _atomic_write_text(paths.settings_path(), payload)
 
 
-#: Environment variables this process filled in from the stored file, so a consumer that treats an explicit export differently from a stored value (``--uds`` refuses an exported port, not a saved one) can tell them apart.
-_ENV_FROM_STORE: set[str] = set()
+#: Names the stored file supplied to this process's environment, with the value it supplied, as JSON. It lives in the environment rather than in module state because a child process (the macOS malloc-tuning re-exec, a supervised proxy started by ``headroom wrap``) inherits the variables themselves but starts with empty module state, and would otherwise judge an inherited stored value as an exported one.
+STORED_ENV_MARKER = "HEADROOM_STORED_ENV"
+
+
+def _stored_env() -> dict[str, str]:
+    """The marker's names and values, or an empty mapping when it is absent or unreadable."""
+    raw = os.environ.get(STORED_ENV_MARKER)
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return {k: v for k, v in parsed.items() if isinstance(k, str) and isinstance(v, str)}
 
 
 def env_came_from_store(name: str) -> bool:
-    """Whether *name* was set in this process by :func:`apply_to_environ` rather than exported."""
-    return name in _ENV_FROM_STORE
+    """Whether *name* holds the value :func:`apply_to_environ` supplied, rather than one exported or set since.
+
+    The value is compared as well as the name, so a variable the stored file once filled in and something later overwrote counts as set, not stored.
+    """
+    recorded = _stored_env().get(name)
+    return recorded is not None and os.environ.get(name) == recorded
 
 
 def apply_to_environ(values: dict[str, Any]) -> None:
-    """``setdefault`` each stored value into ``os.environ`` (explicit export wins)."""
+    """``setdefault`` each stored value into ``os.environ`` (explicit export wins), recording what it supplied in :data:`STORED_ENV_MARKER`."""
+    supplied: dict[str, str] = {}
     for key, value in values.items():
         field = _BY_KEY.get(key)
         if field is None or value is None:
             continue
         if field.env not in os.environ:
-            _ENV_FROM_STORE.add(field.env)
+            supplied[field.env] = _serialize(field, value)
         os.environ.setdefault(field.env, _serialize(field, value))
+    if supplied:
+        os.environ[STORED_ENV_MARKER] = json.dumps({**_stored_env(), **supplied}, sort_keys=True)
 
 
 def _coerce_runtime_values(runtime_values: dict[str, Any] | None) -> dict[str, Any]:

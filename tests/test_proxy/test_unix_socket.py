@@ -445,17 +445,41 @@ class TestCliUdsFlag:
         for name in ("HEADROOM_PORT", "HEADROOM_HOST"):
             monkeypatch.setenv(name, "x")
             monkeypatch.delenv(name)
-        monkeypatch.setattr(settings_store, "_ENV_FROM_STORE", set())
         monkeypatch.setattr(settings_store, "load", lambda: {"port": 9123})
         result, config = self._invoke(["--uds", path])
         assert result.exit_code == 0, result.output
         assert config is not None
         assert config.uds == path
 
+    def test_a_stored_port_inherited_by_a_re_executed_process_does_not_block_uds(
+        self, socket_dir: Path
+    ):
+        # The macOS malloc-tuning re-exec starts a new interpreter with the same environment and empty module state, so provenance has to arrive in the environment itself.
+        path = os.path.join(os.path.abspath(socket_dir), "proxy.sock")
+        result, config = self._invoke(
+            ["--uds", path],
+            env={
+                "HEADROOM_PORT": "9123",
+                "HEADROOM_HOST": None,
+                "HEADROOM_STORED_ENV": '{"HEADROOM_PORT": "9123"}',
+            },
+        )
+        assert result.exit_code == 0, result.output
+        assert config is not None
+        assert config.uds == path
+
+    def test_a_port_exported_over_a_stored_one_blocks_uds(self):
+        result, config = self._invoke(
+            ["--uds", "/run/x/proxy.sock"],
+            env={"HEADROOM_PORT": "9000", "HEADROOM_STORED_ENV": '{"HEADROOM_PORT": "9123"}'},
+        )
+        assert result.exit_code == 2
+        assert "--uds cannot be combined with --port" in result.output
+        assert config is None
+
     def test_an_exported_port_still_blocks_uds_beside_a_stored_one(self, monkeypatch):
         from headroom import settings_store
 
-        monkeypatch.setattr(settings_store, "_ENV_FROM_STORE", set())
         monkeypatch.setattr(settings_store, "load", lambda: {"port": 9123})
         result, config = self._invoke(["--uds", "/run/x/proxy.sock"], env={"HEADROOM_PORT": "9000"})
         assert result.exit_code == 2

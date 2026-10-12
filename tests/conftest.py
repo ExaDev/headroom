@@ -20,6 +20,16 @@ from tests._skip_helpers import external_model_skip_reason
 
 
 @pytest.fixture(autouse=True)
+def _forget_stored_env_marker():
+    """Drop the record of which variables the stored settings supplied once a test ends.
+
+    ``apply_to_environ`` writes it into the process environment so a child process can read it, and a test that applies stored settings would otherwise leave it for the next one.
+    """
+    yield
+    os.environ.pop("HEADROOM_STORED_ENV", None)
+
+
+@pytest.fixture(autouse=True)
 def _undo_process_trust_injection():
     """Undo ``truststore.inject_into_ssl()`` after any test that triggered it.
 
