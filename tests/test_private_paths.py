@@ -36,16 +36,12 @@ DIR = stat.S_IFDIR
         (_stat(ME, DIR | 0o700), {}),
         (_stat(ROOT, FILE | 0o644), {"root_may_own": True}),
         (_stat(ROOT, DIR | 0o755), {"root_may_own": True}),
-        (_stat(ROOT, DIR | 0o1777), {"root_may_own": True, "sticky_may_share": True}),
-        (_stat(ME, DIR | 0o1777), {"root_may_own": True, "sticky_may_share": True}),
     ],
     ids=[
         "own-file",
         "own-dir",
         "root-file",
         "root-dir-0755",
-        "root-sticky-1777",
-        "own-sticky-1777",
     ],
 )
 def test_accepted(info: os.stat_result, kwargs: dict[str, bool]) -> None:
@@ -72,14 +68,19 @@ def test_accepted(info: os.stat_result, kwargs: dict[str, bool]) -> None:
         ),
         (
             _stat(ME, FILE | 0o1666),
-            {"root_may_own": True, "sticky_may_share": False},
+            {"root_may_own": True},
             "writable by group or others (mode 1666)",
         ),
         (_stat(ME, DIR | 0o1777), {}, "writable by group or others (mode 1777)"),
         (
-            _stat(ROOT, DIR | 0o777),
-            {"root_may_own": True, "sticky_may_share": True},
-            "writable by group or others (mode 0777)",
+            _stat(ROOT, DIR | 0o1777),
+            {"root_may_own": True},
+            "writable by group or others (mode 1777)",
+        ),
+        (
+            _stat(ME, DIR | 0o1777),
+            {"root_may_own": True},
+            "writable by group or others (mode 1777)",
         ),
     ],
     ids=[
@@ -88,7 +89,8 @@ def test_accepted(info: os.stat_result, kwargs: dict[str, bool]) -> None:
         "group-writable-file",
         "sticky-file-not-shared",
         "uds-sticky-dir",
-        "shared-dir-without-sticky",
+        "root-sticky-dir",
+        "own-sticky-dir",
     ],
 )
 def test_refused(info: os.stat_result, kwargs: dict[str, bool], description: str) -> None:
