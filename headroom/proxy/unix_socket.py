@@ -84,7 +84,7 @@ def socket_usage_lines(path: str | os.PathLike[str]) -> tuple[str, ...]:
 
 @dataclass
 class UnixSocketListener:
-    """A bound, not yet listening, unix socket and the identity of the file it created."""
+    """A bound and listening unix socket, not yet handed to uvicorn, and the identity of the file it created."""
 
     path: str
     sock: socket.socket
