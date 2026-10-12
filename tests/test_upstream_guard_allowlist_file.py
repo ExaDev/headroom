@@ -396,12 +396,18 @@ def test_a_hash_entry_in_the_variable_is_not_a_comment(monkeypatch: pytest.Monke
 def test_the_identity_cached_is_the_one_read_not_the_one_first_stat_ed(
     allow_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A rename between the guard's ``stat`` and its ``open`` must not cost a second read."""
+    """A rename between the guard's ``stat`` and its ``open`` is retried and then served from the cache.
+
+    The open then reaches a file other than the one the walk agreed on, so that attempt is retried; the version the retry reads is the one cached, so the next check is a cache hit with no read.
+    """
     _replace(allow_file, "http://127.0.0.1:4100")
     real_read = upstream_guard._read_allowlist_file
+    replaced = [False]
 
     def replaced_after_stat(path: str, st: os.stat_result):  # noqa: ANN202
-        _replace(allow_file, "http://127.0.0.1:4200")
+        if not replaced[0]:
+            replaced[0] = True
+            _replace(allow_file, "http://127.0.0.1:4200")
         return real_read(path, st)
 
     monkeypatch.setattr(upstream_guard, "_read_allowlist_file", replaced_after_stat)
@@ -1372,6 +1378,58 @@ def test_a_sticky_directory_on_the_path_is_never_advised_chmod(
     (warning,) = [r.getMessage() for r in caplog.records]
     assert "Move the allowlist file under a directory only you or root can write)" in warning
     assert "chmod" not in warning
+
+
+def _with_other_inode(real: os.stat_result) -> os.stat_result:
+    """``real`` as the stat of a different file: same everything but the inode."""
+    fields = list(real[:10])
+    fields[1] = real.st_ino + 1
+    extras = {
+        name: getattr(real, name)
+        for name in (
+            "st_atime_ns",
+            "st_mtime_ns",
+            "st_ctime_ns",
+            "st_blksize",
+            "st_blocks",
+            "st_rdev",
+        )
+        if hasattr(real, name)
+    }
+    return os.stat_result(fields, extras)
+
+
+@pytest.mark.parametrize(("mismatches", "admitted"), [(1, True), (99, False)])
+def test_the_file_opened_must_be_the_file_the_walk_agreed_on(
+    allow_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    mismatches: int,
+    admitted: bool,
+) -> None:
+    """The open resolves the path again by name; a descriptor for another file is a race once and a refusal if it persists."""
+    caplog.set_level(logging.WARNING, logger="headroom.proxy.upstream_guard")
+    _replace(allow_file, "http://127.0.0.1:4100")
+    inode = allow_file.stat().st_ino
+    real_fstat = os.fstat
+    remaining = [mismatches]
+
+    def opened_something_else(fd: int) -> os.stat_result:
+        real = real_fstat(fd)
+        if real.st_ino == inode and remaining[0] > 0:
+            remaining[0] -= 1
+            return _with_other_inode(real)
+        return real
+
+    monkeypatch.setattr(os, "fstat", opened_something_else)
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is admitted
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    if admitted:
+        assert warnings == []
+    else:
+        (warning,) = warnings
+        assert "the path does not resolve to the file the permission check inspected" in warning
 
 
 def test_concurrent_checks_after_a_change_read_and_log_it_once(
