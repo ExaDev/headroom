@@ -718,12 +718,12 @@ _RESOLVED_ALLOWLIST_PATHS_LOCK = threading.Lock()
 def resolve_allowlist_file_path(raw: str) -> str:
     """Return the file ``raw`` names, with ``~`` expanded and a relative path made absolute.
 
-    A relative path resolves against the working directory at its first use in this process and keeps that meaning afterwards, so a later change of directory cannot repoint the allowlist. ``~user`` for a user that does not exist is left as written, as ``os.path.expanduser`` leaves it, and so is a relative path like any other. Symlinks are not resolved, so a supervisor may swap a link's target. ``raw`` must already be stripped and not blank.
+    A relative path resolves against the working directory at its first use in this process and keeps that meaning afterwards, so a later change of directory cannot repoint the allowlist. ``~user`` for a user that does not exist is left as written, as ``os.path.expanduser`` leaves it, and so is a relative path like any other. Symlinks are not resolved, so a supervisor may swap a link's target, and nothing else is normalised either: ``..`` and a trailing slash are left for the kernel and for :func:`_path_directories`, which both take ``..`` after following any symlink before it (``dir/link/..`` is the link target's parent, not ``dir``), and a trailing slash makes a regular file fail to resolve, as it would for ``open``. ``raw`` must already be stripped and not blank.
     """
     with _RESOLVED_ALLOWLIST_PATHS_LOCK:
         resolved = _RESOLVED_ALLOWLIST_PATHS.get(raw)
         if resolved is None:
-            resolved = os.path.abspath(os.path.expanduser(raw))
+            resolved = os.path.join(os.getcwd(), os.path.expanduser(raw))
             _RESOLVED_ALLOWLIST_PATHS[raw] = resolved
     return resolved
 

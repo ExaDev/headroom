@@ -1214,6 +1214,37 @@ def test_a_link_the_kernel_follows_elsewhere_than_its_text_is_refused(
     assert "the path does not resolve to the file the permission check inspected" in warning
 
 
+def test_dot_dot_after_a_symlink_is_taken_where_the_kernel_takes_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``a/link/../allow`` with ``link -> b/sub`` is ``b/allow`` to the kernel, not the lexical ``a/allow``."""
+    upstream_guard._RESOLVED_ALLOWLIST_PATHS.clear()
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir(mode=0o700)
+    (b / "sub").mkdir(parents=True, mode=0o700)
+    b.chmod(0o700)
+    _replace(a / "allow", "http://127.0.0.1:4100")
+    _replace(b / "allow", "http://127.0.0.1:4200")
+    (a / "link").symlink_to(b / "sub")
+    monkeypatch.setenv(FILE_ENV, f"{a}/link/../allow")
+
+    assert is_safe_upstream_url("http://127.0.0.1:4200/v1") is True
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+
+
+def test_a_trailing_slash_on_a_regular_file_is_refused(
+    allow_file: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger="headroom.proxy.upstream_guard")
+    upstream_guard._RESOLVED_ALLOWLIST_PATHS.clear()
+    _replace(allow_file, "http://127.0.0.1:4100")
+    monkeypatch.setenv(FILE_ENV, f"{allow_file}/")
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+    (warning,) = [r.getMessage() for r in caplog.records]
+    assert "Not a directory (ENOTDIR)" in warning
+
+
 def test_concurrent_checks_after_a_change_read_and_log_it_once(
     allow_file: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
