@@ -29,10 +29,24 @@ Policy:
     sessions are still using. Replace it atomically (write a sibling, then
     rename over it): a change is detected by the file's identity (device,
     inode, size, and modification and status-change times), and an unchanged
-    file is never read again; each check costs a ``stat`` of the file and of
-    the directories that could replace it, which are re-checked every time. A version that cannot be
-    used is remembered the same way, so a broken file is not re-opened on
-    every request.
+    file is never read again; each check costs a ``stat`` of the file and an
+    ``lstat`` of every directory on its path, which are re-checked every
+    time. A version that cannot be used is remembered the same way, so a
+    broken file is not re-opened on every request.
+
+What the file lists is only trusted if nobody but the user running the proxy
+or root could have chosen which file the path reaches (the rule OpenSSH's
+StrictModes applies to authorized_keys). The file must be owned by that user or
+root and not writable by group or others, and so must every directory that
+resolving the path passes through: every directory from ``/`` down to the one
+holding the file, and, when the path meets a symlink anywhere along it, every
+directory down to the one holding that link and on down its target. No
+exception is made for sticky directories, so anything under ``/tmp``,
+``/var/tmp`` or another shared directory is refused, a private subdirectory
+there included. Because each of those directories can be changed only by the
+user or root, nobody else can swap an entry between this check and the
+``open`` that follows it, so the ``open`` resolving the path again by name
+reaches the file the check judged, and no descriptor-relative walk is needed.
 
 Naming a file is itself the operator's choice of allowlist mode, so it never
 falls back to the public-host default, whatever state the file is in:
@@ -48,7 +62,8 @@ falls back to the public-host default, whatever state the file is in:
     before it knows its endpoints therefore gets a proxy that refuses every
     caller-supplied upstream, not one that briefly admits every public host.
   * missing or unusable (permissions, not UTF-8, not a regular file, larger
-    than ``_MAX_ALLOWLIST_FILE_BYTES``): the same as empty, logged at warning level once per distinct failure rather than on
+    than ``_MAX_ALLOWLIST_FILE_BYTES``, or on a path someone other than the
+    user or root could change; see below): the same as empty, logged at warning level once per distinct failure rather than on
     every request, and logged again if it recurs after the file was read.
   * the file variable set to blank: as if unset, mirroring how a blank
     ``HEADROOM_ALLOWED_BASE_URLS`` is treated.
@@ -349,57 +364,72 @@ def _require_private_file(st: os.stat_result, identity: _FileIdentity) -> None:
         raise _UnusableAllowlistFile(f"the file is {problem.description}", identity)
 
 
-def _directory_problem(directories: list[tuple[str, str]]) -> str | None:
-    """Why someone other than this user or root could replace the file through one of ``directories``, else ``None``.
+def _directory_problem(directories: list[str]) -> str | None:
+    """Why someone other than this user or root could change one of ``directories``, else ``None``.
 
-    Each must be owned by this user or root and not writable by group or others, sticky or not: in a shared directory such as ``/tmp`` anyone can plant the entry first (a symlink to a file of their choosing, or a hard link to a root-owned one), and the file it leads to cannot show who planted it. A directory's mode can change without the file changing, so this runs on every check, cached version or not, and its failure is never cached. Skipped where there is no ``os.geteuid`` (Windows).
+    ``directories`` is what :func:`_path_directories` found: every directory resolving the path passes through, ``/`` included. Each must be a directory (by ``lstat``: the list is symlink-free, so a symlink now is a swap) owned by this user or root and not writable by group or others, sticky or not: in a shared directory such as ``/tmp`` anyone can plant an entry first (a symlink to a file of their choosing, or a hard link to a root-owned one), and the file it leads to cannot show who planted it. A directory's mode can change without the file changing, so this runs on every check, cached version or not, at the cost of one ``lstat`` per directory, and its failure is never cached. Skipped where there is no ``os.geteuid`` (Windows).
     """
     if not hasattr(os, "geteuid"):
         return None
-    for directory, which in directories:
+    for directory in directories:
         try:
-            info = os.stat(directory)
+            info = os.lstat(directory)
         except OSError as exc:
-            return f"{which}: {_os_error_reason(exc)}"
+            return f"the directory {_logged_path(directory)} on its path: {_os_error_reason(exc)}"
+        if not stat.S_ISDIR(info.st_mode):
+            return f"{_logged_path(directory)} on its path is no longer a directory"
         problem = foreign_write_access(info, root_may_own=True)
         if problem is not None:
-            return f"{which} is {problem.description}"
+            return f"the directory {_logged_path(directory)} on its path is {problem.description}"
     return None
 
 
-# The most symlinks walked while finding the directories that hold a path's chain: Linux's MAXSYMLINKS (40), the larger of the common kernels' limits (macOS's is 32). The kernel refuses a longer chain before this walk would see it, since the file is stat-ed first, so the limit only bounds the walk.
+# The most symlinks followed while resolving the path: Linux's MAXSYMLINKS (40), the larger of the common kernels' limits (macOS's is 32). The kernel refuses a longer chain before this walk would see it, since the file is stat-ed first, so the limit only bounds the walk.
 _MAX_SYMLINK_HOPS = 40
 
 
 class _UnwalkableAllowlistPath(Exception):
-    """The path's chain of symlinks could not be walked to the file."""
+    """The path could not be resolved to the file one entry at a time."""
 
 
-def _allowlist_directories(path: str) -> list[tuple[str, str]]:
-    """The directories whose write access could replace the file ``path`` names, each with how to describe it.
+def _path_directories(path: str) -> list[str]:
+    """Every directory that resolving the absolute ``path`` passes through, from ``/`` down, each once.
 
-    Every hop counts: the directory holding ``path``, the directory holding each symlink the path passes through on the way to the file, and the directory holding the file. Whoever can write any of them could swap the entry there and so choose the file. Each directory is resolved (ancestor symlinks such as ``/tmp`` to ``/private/tmp`` followed) and checked once. Raises ``OSError`` when a link cannot be read and :class:`_UnwalkableAllowlistPath` past ``_MAX_SYMLINK_HOPS``.
+    The path is resolved as the kernel resolves it, one entry at a time, following each symlink where it is met (in the middle of the path as well as at its end, with a relative target taken from the link's own directory), and the directory holding every entry looked up is recorded. That makes the list the directories whose entries decide which file the path reaches: the directory holding the path's last entry, every directory above it, the directory holding each symlink and every directory above that, and so on to the file. Each is symlink-free, so a check on it cannot be redirected. Raises ``OSError`` when a link cannot be read and :class:`_UnwalkableAllowlistPath` past ``_MAX_SYMLINK_HOPS`` links. Returns nothing where there is no ``os.geteuid`` (Windows), where ownership is not judged.
     """
-    directories: list[tuple[str, str]] = []
+    if not hasattr(os, "geteuid"):
+        return []
+    root = os.sep
+    pending = list(reversed(path.split(os.sep)))
+    current = root
+    directories: list[str] = []
     seen: set[str] = set()
-    entry = path
-    for hop in range(_MAX_SYMLINK_HOPS + 1):
-        is_link = os.path.islink(entry)
-        if hop == 0:
-            which = "its directory"
-        elif is_link:
-            which = "the directory of a symlink it passes through"
-        else:
-            which = "the directory of the file its symlink resolves to"
-        directory = os.path.realpath(os.path.dirname(entry))
-        if directory not in seen:
-            seen.add(directory)
-            directories.append((directory, which))
-        if not is_link:
-            return directories
-        # An absolute target replaces the base; a relative one is relative to the link's own directory.
-        entry = os.path.join(os.path.dirname(entry), os.readlink(entry))
-    raise _UnwalkableAllowlistPath(f"its symlinks go more than {_MAX_SYMLINK_HOPS} deep")
+    hops = 0
+    while pending:
+        name = pending.pop()
+        if name in ("", "."):
+            continue
+        if name == "..":
+            # `current` is symlink-free, so its lexical parent is its real one.
+            current = os.path.dirname(current)
+            continue
+        if current not in seen:
+            seen.add(current)
+            directories.append(current)
+        entry = os.path.join(current, name)
+        if os.path.islink(entry):
+            hops += 1
+            if hops > _MAX_SYMLINK_HOPS:
+                raise _UnwalkableAllowlistPath(
+                    f"its symlinks go more than {_MAX_SYMLINK_HOPS} deep"
+                )
+            target = os.readlink(entry)
+            if os.path.isabs(target):
+                current = root
+            pending.extend(reversed(target.split(os.sep)))
+        elif pending:
+            current = entry
+    return directories
 
 
 def _read_allowlist_file(path: str, st: os.stat_result) -> tuple[_FileIdentity, str]:
@@ -444,7 +474,7 @@ def _read_allowlist_file(path: str, st: os.stat_result) -> tuple[_FileIdentity, 
 class _AllowlistFiles:
     """What each allowlist file held, re-read only when the file's identity changes.
 
-    A version that could not be used is cached too, as ``None``, so a file that is oversized, not UTF-8 or unreadable costs the same ``stat`` calls per check as a good one, not an open and a read on every request. A good version is served only while its directories still pass :func:`_directory_problem`, checked on every request; failing that it is withheld, not dropped, and served again once they pass. Which directories those are is worked out when the version is read and kept with it, since walking the chain again would cost a ``realpath`` and a ``readlink`` per hop on every request: a link repointed so that it still reaches the same file version (same identity) keeps the old list until the file changes. Repointing it at a different file changes the identity, which re-reads and re-walks. A failure that is not the file's own (see ``_FILE_ERRNOS``) is not cached: that check fails closed and the next one tries again.
+    A version that could not be used is cached too, as ``None``, so a file that is oversized, not UTF-8 or unreadable costs the same ``stat`` calls per check as a good one, not an open and a read on every request. A good version is served only while its directories still pass :func:`_directory_problem`, checked on every request; failing that it is withheld, not dropped, and served again once they pass. Which directories those are is worked out when the version is read and kept with it, since resolving the path again would cost a ``readlink`` per link and a lookup per entry on every request. Only the user or root can repoint a link on the path (every directory holding one is checked), and repointing it at a different file changes the identity, which re-reads and re-resolves; one repointed to reach the same file version keeps the old list until the file changes. A failure that is not the file's own (see ``_FILE_ERRNOS``) is not cached: that check fails closed and the next one tries again.
 
     Thread-safe: the event loop and the resolver pool both reach the guard. Checks against an unchanged file take only the bookkeeping lock. Checks that see a change queue on one reload lock and re-check the cache once they hold it, so a change is read and logged once however many requests arrive together. The wait is bounded in bytes (one read of at most ``_MAX_ALLOWLIST_FILE_BYTES``), not in time: a file on a stalled mount holds the reload, and every check that saw the change, for as long as the filesystem does, and a synchronous caller of :func:`is_safe_upstream_url` on the event loop blocks the loop meanwhile, as it already would on the ``stat``. Event-loop callers should use :func:`is_safe_upstream_url_async`, which runs the check on a worker thread.
     """
@@ -453,14 +483,12 @@ class _AllowlistFiles:
         self._lock = threading.Lock()
         self._reload_lock = threading.Lock()
         # path -> (identity of the version read, its entries or None when unusable, the directories to re-check)
-        self._loaded: dict[
-            str, tuple[_FileIdentity, Destinations | None, list[tuple[str, str]]]
-        ] = {}
+        self._loaded: dict[str, tuple[_FileIdentity, Destinations | None, list[str]]] = {}
         self._reported: dict[str, str] = {}
 
     def _cached(
         self, path: str, identity: _FileIdentity
-    ) -> tuple[Destinations | None, list[tuple[str, str]]] | None:
+    ) -> tuple[Destinations | None, list[str]] | None:
         """What the cached version held and its directories, if ``identity`` is that version, else ``None``."""
         with self._lock:
             cached = self._loaded.get(path)
@@ -471,7 +499,7 @@ class _AllowlistFiles:
     def _serve(
         self,
         path: str,
-        cached: tuple[Destinations | None, list[tuple[str, str]]],
+        cached: tuple[Destinations | None, list[str]],
         file_env: str,
         env: str,
     ) -> Destinations | None:
@@ -510,7 +538,7 @@ class _AllowlistFiles:
             if cached is not None:
                 return self._serve(path, cached, file_env, env)
             try:
-                directories = _allowlist_directories(path)
+                directories = _path_directories(path)
             except OSError as exc:
                 self._report(path, _os_error_reason(exc), file_env, env)
                 return None
