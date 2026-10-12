@@ -12,7 +12,7 @@ Contract with the caller:
 
 * The parent directory must already exist and must be private to the user running the proxy: owned by the current effective uid and not writable by group or others (``0o700`` is the recommended mode). Whoever can write the directory can unlink the socket and bind their own at the same path, so this is checked, with a one-line error, before anything is bound; a sticky bit does not substitute for it (see :func:`_require_safe_parent`). This module never creates or chmods the directory; the socket's own ``0o600`` mode is the second layer, not the only one. Directories above the parent are not inspected.
 * A socket file left at the path by a process that has exited (nothing accepts connections on it) is removed and replaced. A socket that still accepts connections, or any path that is not a socket, is refused with :class:`UnixSocketInUseError`.
-* Checking for a stale socket and binding are two steps, so two proxies started on the same path at the same instant can race. Supervising a single proxy per path is the caller's job.
+* Checking for a stale socket and binding are two steps, so two proxies started on the same path at the same instant can still race; one started after the other has bound is refused. Supervising a single proxy per path is the caller's job.
 * On clean shutdown the socket file is removed, but only if the path still names the socket this process bound. That includes SIGTERM: uvicorn finishes its graceful shutdown and then re-raises the signal with the previous handler restored, which under the default handler would kill the process before any cleanup ran, so :func:`serving_unix_socket` installs a handler that unwinds the stack instead and re-raises SIGTERM itself once the file is gone.
 """
 
@@ -214,7 +214,7 @@ def _remove_stale_socket(path: str) -> None:
 def bind_unix_listener(path: str) -> UnixSocketListener:
     """Bind a stream socket at *path* with mode :data:`SOCKET_MODE`.
 
-    The socket is chmodded before uvicorn calls ``listen()`` on it, so no peer can connect while the file still carries the umask-derived mode. The returned listener's ``path`` is the one resolved by :func:`checked_unix_socket_path`.
+    The socket is chmodded before it starts listening, so no peer can connect while the file still carries the umask-derived mode, and it is listening on return, so a second proxy started during this one's startup finds it in use rather than stale. The returned listener's ``path`` is the one resolved by :func:`checked_unix_socket_path`.
     """
     path = checked_unix_socket_path(path)
     _remove_stale_socket(path)
@@ -222,6 +222,8 @@ def bind_unix_listener(path: str) -> UnixSocketListener:
     try:
         sock.bind(path)
         os.chmod(path, SOCKET_MODE)
+        # Listening starts here, not when uvicorn gets the socket: until it is listening a connect is refused, which is what a stale socket looks like to `_remove_stale_socket`, so a second proxy started while this one is still starting up would delete this one's socket and bind its own. uvicorn's own `listen()` later only sets the backlog.
+        sock.listen(socket.SOMAXCONN)
         bound = os.lstat(path)
     except BaseException:
         sock.close()

@@ -248,6 +248,20 @@ class TestBindUnixListener:
         finally:
             live.close()
 
+    def test_refuses_a_second_bind_while_the_first_is_still_starting(self, socket_dir: Path):
+        path = socket_dir / "proxy.sock"
+        first = bind_unix_listener(str(path))
+        try:
+            # The first proxy has bound and not handed its socket to uvicorn yet, which is the whole of its startup. A second one must find it in use, not stale.
+            with pytest.raises(UnixSocketInUseError, match="already listening"):
+                bind_unix_listener(str(path))
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.connect(str(path))
+                accepted, _ = first.sock.accept()
+                accepted.close()
+        finally:
+            first.close()
+
     def test_refuses_non_socket(self, socket_dir: Path):
         path = socket_dir / "proxy.sock"
         path.write_text("not a socket")
@@ -422,6 +436,11 @@ class TestCliUdsFlag:
         assert result.exit_code == 2
         assert "--uds cannot be combined with --port" in result.output
         assert config is None
+
+    def test_the_refusal_names_a_stored_setting_as_a_possible_source(self):
+        result, _ = self._invoke(["--uds", "/run/x/proxy.sock"], env={"HEADROOM_PORT": "9000"})
+        assert result.exit_code == 2
+        assert "stored host or port setting" in result.output
 
     def test_uds_reaches_proxy_config(self, socket_dir: Path):
         path = os.path.join(os.path.abspath(socket_dir), "proxy.sock")
