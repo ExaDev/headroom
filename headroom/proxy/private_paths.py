@@ -30,7 +30,7 @@ def foreign_write_access(
 
     The sticky bit is never a substitute for write permission: in a sticky shared directory anyone can still create a new entry, such as a symlink to a file of their choosing or (where hard links to others' files are allowed) a hard link to one, at a path nobody has claimed yet, and checking the file that entry leads to cannot tell who made it.
 
-    ``root_may_own`` relaxes the owner rule for paths the proxy only reads, never binds; it is off by default, which is the ``--uds`` rule. It also accepts uid 0, which can change anything anyway, so trusting it adds no one (bind mounts and Kubernetes ConfigMap volumes are root-owned while the proxy runs as another user).
+    ``root_may_own`` relaxes the owner rule for paths the proxy only reads, never binds; it is off by default, which is the ``--uds`` rule. It also accepts uid 0, which can change anything anyway, so trusting it adds no one, and it lets a proxy running as another user read a root-owned file, such as one in a root-owned bind-mounted directory.
     """
     euid = os.geteuid()
     if info.st_uid != euid and not (root_may_own and info.st_uid == 0):
