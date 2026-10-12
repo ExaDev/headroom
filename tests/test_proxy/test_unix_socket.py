@@ -652,7 +652,12 @@ class TestPlatformWithoutUnixSockets:
 
 class TestStoredEnvMarker:
     def test_a_marker_nested_past_the_recursion_limit_is_treated_as_absent(self):
-        env = {"HEADROOM_PORT": "9123", "_HEADROOM_STORED_ENV": "[" * 100_000}
+        # Closed, so a parser that reads the whole input must recurse: it raises RecursionError on every supported Python, where an unclosed input fails early on some.
+        depth = 1_000_000
+        env = {
+            "HEADROOM_PORT": "9123",
+            "_HEADROOM_STORED_ENV": "[" * depth + "]" * depth,
+        }
         assert not env_came_from_store("HEADROOM_PORT", env)
 
     @pytest.mark.parametrize("marker", ["not json", "[]", '{"HEADROOM_PORT": 9123}', "null"])

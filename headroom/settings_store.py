@@ -1042,7 +1042,7 @@ def _stored_env(env: Mapping[str, str] = os.environ) -> dict[str, str]:
     try:
         parsed = json.loads(raw)
     except (ValueError, RecursionError):
-        # Deeply nested input raises RecursionError on Python 3.10 to 3.12, which is not a ValueError.
+        # Input nested deeper than the interpreter's parser allows raises RecursionError, which is not a ValueError; the depth at which it does varies by Python version.
         return {}
     if not isinstance(parsed, dict):
         return {}

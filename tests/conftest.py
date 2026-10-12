@@ -79,6 +79,8 @@ def _scrub_developer_headroom_env(monkeypatch, tmp_path):
         if key.startswith("HEADROOM_"):
             monkeypatch.delenv(key, raising=False)
     monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
+    # The stored-settings marker is an internal variable with a leading underscore, which the prefix scrub above does not reach, and a shell started under ``headroom wrap`` inherits it.
+    monkeypatch.delenv("_HEADROOM_STORED_ENV", raising=False)
     # Clearing HEADROOM_* alone leaves file-backed settings active. Give every
     # test its own store so proxy/CLI startup cannot load developer settings and
     # saves cannot rewrite them. Tests of path precedence can override this.
