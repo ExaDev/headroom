@@ -34,6 +34,7 @@ from headroom.proxy.unix_socket import (  # noqa: E402
     max_socket_path_bytes,
     require_unix_sockets,
 )
+from headroom.settings_store import env_came_from_store  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="needs AF_UNIX")
 
@@ -461,7 +462,7 @@ class TestCliUdsFlag:
             env={
                 "HEADROOM_PORT": "9123",
                 "HEADROOM_HOST": None,
-                "HEADROOM_STORED_ENV": '{"HEADROOM_PORT": "9123"}',
+                "_HEADROOM_STORED_ENV": '{"HEADROOM_PORT": "9123"}',
             },
         )
         assert result.exit_code == 0, result.output
@@ -471,7 +472,7 @@ class TestCliUdsFlag:
     def test_a_port_exported_over_a_stored_one_blocks_uds(self):
         result, config = self._invoke(
             ["--uds", "/run/x/proxy.sock"],
-            env={"HEADROOM_PORT": "9000", "HEADROOM_STORED_ENV": '{"HEADROOM_PORT": "9123"}'},
+            env={"HEADROOM_PORT": "9000", "_HEADROOM_STORED_ENV": '{"HEADROOM_PORT": "9123"}'},
         )
         assert result.exit_code == 2
         assert "--uds cannot be combined with --port" in result.output
@@ -647,3 +648,29 @@ class TestPlatformWithoutUnixSockets:
         )
         assert proc.returncode == 1
         assert proc.stderr.strip().startswith("error: --uds needs unix domain sockets")
+
+
+class TestStoredEnvMarker:
+    def test_a_marker_nested_past_the_recursion_limit_is_treated_as_absent(self):
+        env = {"HEADROOM_PORT": "9123", "_HEADROOM_STORED_ENV": "[" * 100_000}
+        assert not env_came_from_store("HEADROOM_PORT", env)
+
+    @pytest.mark.parametrize("marker", ["not json", "[]", '{"HEADROOM_PORT": 9123}', "null"])
+    def test_an_unreadable_marker_never_makes_a_port_look_stored(self, marker: str):
+        env = {"HEADROOM_PORT": "9123", "_HEADROOM_STORED_ENV": marker}
+        assert not env_came_from_store("HEADROOM_PORT", env)
+
+    def test_the_module_entry_point_admits_a_port_only_the_store_supplied(self):
+        from headroom.proxy.server import _refuse_tcp_env_with_uds
+
+        _refuse_tcp_env_with_uds(
+            {"HEADROOM_PORT": "9123", "_HEADROOM_STORED_ENV": '{"HEADROOM_PORT": "9123"}'}
+        )
+
+    def test_the_module_entry_point_still_refuses_an_exported_port(self):
+        from headroom.proxy.server import _refuse_tcp_env_with_uds
+
+        with pytest.raises(SystemExit):
+            _refuse_tcp_env_with_uds(
+                {"HEADROOM_PORT": "9000", "_HEADROOM_STORED_ENV": '{"HEADROOM_PORT": "9123"}'}
+            )

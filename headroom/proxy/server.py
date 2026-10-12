@@ -6656,9 +6656,13 @@ TCP_LISTEN_ENV_VARS = ("HEADROOM_HOST", "HEADROOM_PORT")
 def _refuse_tcp_env_with_uds(env: Mapping[str, str]) -> None:
     """Exit with an error when a TCP listen address is set in the environment alongside ``--uds``.
 
-    Ignoring it would hide a configuration that expects the proxy on a TCP port.
+    Ignoring it would hide a configuration that expects the proxy on a TCP port. A value that only the stored settings supplied, inherited from a ``headroom`` parent, is not that: the dashboard's saved port is not a request for a TCP listener.
     """
-    present = [name for name in TCP_LISTEN_ENV_VARS if env.get(name)]
+    from headroom.settings_store import env_came_from_store
+
+    present = [
+        name for name in TCP_LISTEN_ENV_VARS if env.get(name) and not env_came_from_store(name, env)
+    ]
     if present:
         sys.exit(
             f"error: --uds cannot be combined with {', '.join(present)}; unset it or drop --uds"

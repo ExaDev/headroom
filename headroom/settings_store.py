@@ -21,6 +21,7 @@ import logging
 import math
 import os
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -1029,31 +1030,32 @@ def save(values: dict[str, Any]) -> None:
     _atomic_write_text(paths.settings_path(), payload)
 
 
-#: Names the stored file supplied to this process's environment, with the value it supplied, as JSON. It lives in the environment rather than in module state because a child process (the macOS malloc-tuning re-exec, a supervised proxy started by ``headroom wrap``) inherits the variables themselves but starts with empty module state, and would otherwise judge an inherited stored value as an exported one.
-STORED_ENV_MARKER = "HEADROOM_STORED_ENV"
+#: Names the stored file supplied to this process's environment, with the value it supplied, as JSON. The leading underscore marks it as internal, as ``_HEADROOM_MALLOC_TUNED`` is, and keeps it out of the ``HEADROOM_`` variables the container install passes through. It lives in the environment rather than in module state because a child process (the macOS malloc-tuning re-exec, a supervised proxy started by ``headroom wrap``) inherits the variables themselves but starts with empty module state, and would otherwise judge an inherited stored value as an exported one.
+STORED_ENV_MARKER = "_HEADROOM_STORED_ENV"
 
 
-def _stored_env() -> dict[str, str]:
-    """The marker's names and values, or an empty mapping when it is absent or unreadable."""
-    raw = os.environ.get(STORED_ENV_MARKER)
+def _stored_env(env: Mapping[str, str] = os.environ) -> dict[str, str]:
+    """The marker's names and values in *env*, or an empty mapping when it is absent or unreadable."""
+    raw = env.get(STORED_ENV_MARKER)
     if not raw:
         return {}
     try:
         parsed = json.loads(raw)
-    except ValueError:
+    except (ValueError, RecursionError):
+        # Deeply nested input raises RecursionError on Python 3.10 to 3.12, which is not a ValueError.
         return {}
     if not isinstance(parsed, dict):
         return {}
     return {k: v for k, v in parsed.items() if isinstance(k, str) and isinstance(v, str)}
 
 
-def env_came_from_store(name: str) -> bool:
-    """Whether *name* holds the value :func:`apply_to_environ` supplied, rather than one exported or set since.
+def env_came_from_store(name: str, env: Mapping[str, str] = os.environ) -> bool:
+    """Whether *name* holds, in *env*, the value :func:`apply_to_environ` supplied rather than one exported or set since.
 
     The value is compared as well as the name, so a variable the stored file once filled in and something later overwrote counts as set, not stored.
     """
-    recorded = _stored_env().get(name)
-    return recorded is not None and os.environ.get(name) == recorded
+    recorded = _stored_env(env).get(name)
+    return recorded is not None and env.get(name) == recorded
 
 
 def apply_to_environ(values: dict[str, Any]) -> None:

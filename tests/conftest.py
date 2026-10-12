@@ -26,7 +26,7 @@ def _forget_stored_env_marker():
     ``apply_to_environ`` writes it into the process environment so a child process can read it, and a test that applies stored settings would otherwise leave it for the next one.
     """
     yield
-    os.environ.pop("HEADROOM_STORED_ENV", None)
+    os.environ.pop("_HEADROOM_STORED_ENV", None)
 
 
 @pytest.fixture(autouse=True)
