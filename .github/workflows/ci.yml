@@ -567,7 +567,8 @@ jobs:
           retention-days: 7
 
   commitlint:
-    if: github.event_name == 'pull_request'
+    # A branch that merges upstream carries upstream's own commit history, which this repository cannot rewrite and which its own rules do not govern.
+    if: github.event_name == 'pull_request' && !startsWith(github.head_ref, 'reconcile/upstream')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
