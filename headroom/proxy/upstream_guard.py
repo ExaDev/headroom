@@ -392,18 +392,19 @@ class _UnwalkableAllowlistPath(Exception):
     """The path could not be resolved to the file one entry at a time."""
 
 
-def _path_directories(path: str) -> list[str]:
-    """Every directory that resolving the absolute ``path`` passes through, from ``/`` down, each once.
+def _path_directories(path: str) -> tuple[list[str], str | None]:
+    """Every directory that resolving the absolute ``path`` passes through, from ``/`` down, each once, and the entry it ends at.
 
-    The path is resolved as the kernel resolves it, one entry at a time, following each symlink where it is met (in the middle of the path as well as at its end, with a relative target taken from the link's own directory), and the directory holding every entry looked up is recorded. That makes the list the directories whose entries decide which file the path reaches: the directory holding the path's last entry, every directory above it, the directory holding each symlink and every directory above that, and so on to the file. Each is symlink-free, so a check on it cannot be redirected. Raises ``OSError`` when a link cannot be read and :class:`_UnwalkableAllowlistPath` past ``_MAX_SYMLINK_HOPS`` links. Returns nothing where there is no ``os.geteuid`` (Windows), where ownership is not judged.
+    The path is resolved as the kernel resolves it, one entry at a time, following each symlink where it is met (in the middle of the path as well as at its end, with a relative target taken from the link's own directory), and the directory holding every entry looked up is recorded. That makes the list the directories whose entries decide which file the path reaches: the directory holding the path's last entry, every directory above it, the directory holding each symlink and every directory above that, and so on to the file. Each is symlink-free, so a check on it cannot be redirected. The entry it ends at is what the walk believes the path names; the caller compares it with what the kernel actually opens, since a link the kernel follows by something other than its text (a ``/proc/<pid>/root`` magic link) would otherwise send the check to one file and the read to another. Raises ``OSError`` when a link cannot be read and :class:`_UnwalkableAllowlistPath` past ``_MAX_SYMLINK_HOPS`` links. Returns no directories and no entry where there is no ``os.geteuid`` (Windows), where ownership is not judged.
     """
     if not hasattr(os, "geteuid"):
-        return []
+        return [], None
     root = os.sep
     pending = list(reversed(path.split(os.sep)))
     current = root
     directories: list[str] = []
     seen: set[str] = set()
+    final: str | None = None
     hops = 0
     while pending:
         name = pending.pop()
@@ -427,9 +428,33 @@ def _path_directories(path: str) -> list[str]:
             if os.path.isabs(target):
                 current = root
             pending.extend(reversed(target.split(os.sep)))
-        elif pending:
+            continue
+        final = entry
+        if pending:
             current = entry
-    return directories
+    return directories, final
+
+
+# How many times the walk is repeated when its final entry and the kernel's file differ. A replace landing between the two back-to-back lookups makes them differ once; a link the kernel follows by something other than its text (a /proc/<pid>/root magic link) makes them differ every time. Five consecutive races within a pair of adjacent syscalls is far past any real writer.
+_RESOLVE_ATTEMPTS = 5
+
+
+def _walk_agreeing_with_the_kernel(path: str) -> list[str]:
+    """The directories on ``path`` (:func:`_path_directories`), once the walk's final entry is the file the kernel resolves the path to.
+
+    Compares the device and inode of an ``lstat`` of the walk's final entry with a ``stat`` of ``path`` taken straight after it, repeating the walk up to ``_RESOLVE_ATTEMPTS`` times so that a replacement racing the two lookups is not mistaken for a disagreement. Raises :class:`_UnwalkableAllowlistPath` when they never agree, and ``OSError`` from either lookup.
+    """
+    for _ in range(_RESOLVE_ATTEMPTS):
+        directories, final = _path_directories(path)
+        if final is None:
+            return directories
+        walked = os.lstat(final)
+        opened = os.stat(path)
+        if (walked.st_dev, walked.st_ino) == (opened.st_dev, opened.st_ino):
+            return directories
+    raise _UnwalkableAllowlistPath(
+        "the path does not resolve to the file the permission check inspected"
+    )
 
 
 def _read_allowlist_file(path: str, st: os.stat_result) -> tuple[_FileIdentity, str]:
@@ -538,7 +563,7 @@ class _AllowlistFiles:
             if cached is not None:
                 return self._serve(path, cached, file_env, env)
             try:
-                directories = _path_directories(path)
+                directories = _walk_agreeing_with_the_kernel(path)
             except OSError as exc:
                 self._report(path, _os_error_reason(exc), file_env, env)
                 return None

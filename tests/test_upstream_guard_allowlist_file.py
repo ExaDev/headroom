@@ -970,7 +970,8 @@ def test_a_relative_symlink_hop_resolves_against_the_link_s_directory(
     monkeypatch.setenv(FILE_ENV, str(priv / "allow"))
 
     assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is True
-    directories = upstream_guard._path_directories(str(priv / "allow"))
+    directories, final = upstream_guard._path_directories(str(priv / "allow"))
+    assert final == os.path.join(os.path.realpath(safe), "real")
     assert directories[-2:] == [os.path.realpath(priv), os.path.realpath(safe)]
     assert directories[0] == os.sep
 
@@ -1184,6 +1185,33 @@ def test_the_real_directories_above_tmp_path_are_judged(
 
     # On Linux tmp_path is under /tmp (sticky, world-writable), so this expects a refusal there.
     assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is trusted
+
+
+@_POSIX_USER
+def test_a_link_the_kernel_follows_elsewhere_than_its_text_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A /proc/<pid>/root magic link reads as one path and leads to another; simulated by a readlink that disagrees with the kernel."""
+    caplog.set_level(logging.WARNING, logger="headroom.proxy.upstream_guard")
+    priv = tmp_path / "priv"
+    priv.mkdir(mode=0o700)
+    _replace(priv / "opened", "http://127.0.0.1:4100")
+    _replace(priv / "inspected", "http://127.0.0.1:4200")
+    (priv / "allow").symlink_to(priv / "opened")
+    monkeypatch.setenv(FILE_ENV, str(priv / "allow"))
+    real_readlink = os.readlink
+
+    def readlink_text_disagrees(path: object, *args: object, **kwargs: object) -> str:
+        if os.fspath(path) == os.path.join(os.path.realpath(priv), "allow"):  # type: ignore[arg-type]
+            return str(priv / "inspected")
+        return real_readlink(path, *args, **kwargs)  # type: ignore[arg-type,no-any-return]
+
+    monkeypatch.setattr(os, "readlink", readlink_text_disagrees)
+
+    assert is_safe_upstream_url("http://127.0.0.1:4100/v1") is False
+    assert is_safe_upstream_url("http://127.0.0.1:4200/v1") is False
+    (warning,) = [r.getMessage() for r in caplog.records]
+    assert "the path does not resolve to the file the permission check inspected" in warning
 
 
 def test_concurrent_checks_after_a_change_read_and_log_it_once(
