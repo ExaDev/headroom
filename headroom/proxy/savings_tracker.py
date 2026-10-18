@@ -769,8 +769,74 @@ def _empty_project_entry() -> dict[str, Any]:
         "compression_savings_usd": 0.0,
         "total_input_tokens": 0,
         "total_input_cost_usd": 0.0,
+        # The mean of each request's own saving percentage needs the percentages themselves, which the totals above cannot give back: the sum of them, and how many requests contributed to it. The count is separate from ``requests`` because an entry persisted before these fields existed has requests the sum never saw, and dividing by ``requests`` would understate the mean for good.
+        "request_savings_percent_sum": 0.0,
+        "request_savings_percent_requests": 0,
         "last_activity_at": None,
     }
+
+
+def _entry_view(entry: dict[str, Any]) -> dict[str, Any]:
+    """A per-project or per-session entry as the stats endpoints present it, with its two derived percentages.
+
+    ``savings_percent`` is the overall figure: everything saved over everything that would have been sent, so a large request weighs more than a small one. ``avg_request_savings_percent`` is the mean of each request's own saving, every request weighing the same, and is ``None`` for an entry no request has contributed a percentage to (one persisted before the accumulators existed, until new requests arrive).
+    """
+    view = dict(entry)
+    total_before = entry["tokens_saved"] + entry["total_input_tokens"]
+    view["savings_percent"] = round(
+        (entry["tokens_saved"] / total_before * 100) if total_before > 0 else 0.0,
+        2,
+    )
+    contributing = entry["request_savings_percent_requests"]
+    view["avg_request_savings_percent"] = (
+        round(entry["request_savings_percent_sum"] / contributing, 2) if contributing > 0 else None
+    )
+    return view
+
+
+def _accumulate_entry(
+    entry: dict[str, Any],
+    *,
+    timestamp_dt: datetime,
+    requests_delta: int,
+    tokens_saved_delta: int,
+    savings_usd_delta: float,
+    input_tokens_delta: int,
+    input_cost_usd_delta: float,
+    request_savings_percent: float,
+) -> None:
+    """Fold one request's deltas into a per-project or per-session entry.
+
+    ``request_savings_percent`` is that request's own saving, in the same terms as the entry's overall figure (saved over saved plus input sent), added to a running sum with a count of how many requests contributed so the mean of the per-request figures can be read back.
+    """
+    entry["requests"] += max(requests_delta, 0)
+    entry["tokens_saved"] += max(tokens_saved_delta, 0)
+    entry["compression_savings_usd"] = round(
+        entry["compression_savings_usd"] + savings_usd_delta, 6
+    )
+    entry["total_input_tokens"] += max(input_tokens_delta, 0)
+    entry["total_input_cost_usd"] = round(
+        entry["total_input_cost_usd"] + max(input_cost_usd_delta, 0.0), 6
+    )
+    if requests_delta > 0:
+        entry["request_savings_percent_sum"] = round(
+            entry["request_savings_percent_sum"] + request_savings_percent, 6
+        )
+        entry["request_savings_percent_requests"] += requests_delta
+    entry["last_activity_at"] = _to_utc_iso(timestamp_dt)
+
+
+def _normalize_request_savings_percent(normalized: dict[str, Any], entry: dict[str, Any]) -> None:
+    """Carry a persisted entry's per-request percentage accumulators onto ``normalized``.
+
+    Absent in state files written before the fields existed, which read as no requests contributing, so such an entry shows no mean until new requests accumulate rather than a mean over requests the sum never saw.
+    """
+    normalized["request_savings_percent_sum"] = round(
+        _coerce_float(entry.get("request_savings_percent_sum")), 6
+    )
+    normalized["request_savings_percent_requests"] = _coerce_int(
+        entry.get("request_savings_percent_requests")
+    )
 
 
 def _normalize_projects(raw: Any) -> dict[str, dict[str, Any]]:
@@ -782,6 +848,7 @@ def _normalize_projects(raw: Any) -> dict[str, dict[str, Any]]:
         if cleaned_name is None or not isinstance(entry, dict):
             continue
         normalized = _empty_project_entry()
+        _normalize_request_savings_percent(normalized, entry)
         normalized["requests"] = _coerce_int(entry.get("requests"))
         normalized["tokens_saved"] = _coerce_int(entry.get("tokens_saved"))
         normalized["compression_savings_usd"] = round(
@@ -825,6 +892,7 @@ def _normalize_sessions(raw: Any) -> dict[str, dict[str, Any]]:
         if key is None or not isinstance(entry, dict):
             continue
         normalized = _empty_session_entry()
+        _normalize_request_savings_percent(normalized, entry)
         normalized["requests"] = _coerce_int(entry.get("requests"))
         normalized["tokens_saved"] = _coerce_int(entry.get("tokens_saved"))
         normalized["compression_savings_usd"] = round(
@@ -1154,6 +1222,11 @@ class SavingsTracker:
         delta_tokens_saved = _coerce_int(tokens_saved)
         delta_tool_tokens_saved = max(_coerce_int(tool_search_saved), 0)
         delta_input_tokens = _coerce_int(input_tokens)
+        # This request's own saving in the entries' terms (saved over saved plus input sent), so a mean of these and the entries' overall figure are measured the same way.
+        request_before = delta_tokens_saved + delta_input_tokens
+        request_savings_percent = (
+            delta_tokens_saved / request_before * 100 if request_before > 0 else 0.0
+        )
         delta_output_tokens_saved = max(_coerce_int(output_tokens_saved), 0)
         delta_cache_read_tokens = _coerce_int(cache_read_tokens)
         priced = estimated_savings_usd
@@ -1383,6 +1456,7 @@ class SavingsTracker:
                 savings_usd_delta=delta_savings_usd,
                 input_tokens_delta=delta_input_tokens,
                 input_cost_usd_delta=delta_input_cost_usd,
+                request_savings_percent=request_savings_percent,
             )
 
             self._record_session_locked(
@@ -1393,6 +1467,7 @@ class SavingsTracker:
                 savings_usd_delta=delta_savings_usd,
                 input_tokens_delta=delta_input_tokens,
                 input_cost_usd_delta=delta_input_cost_usd,
+                request_savings_percent=request_savings_percent,
             )
 
             # In --mode cache, headroom's own compression (tokens_saved) is
@@ -1540,6 +1615,7 @@ class SavingsTracker:
         savings_usd_delta: float = 0.0,
         input_tokens_delta: int = 0,
         input_cost_usd_delta: float = 0.0,
+        request_savings_percent: float = 0.0,
     ) -> None:
         """Accumulate per-project savings. Caller must hold ``self._lock``.
 
@@ -1552,16 +1628,16 @@ class SavingsTracker:
             return
         projects: dict[str, dict[str, Any]] = self._state.setdefault("projects", {})
         entry = projects.setdefault(name, _empty_project_entry())
-        entry["requests"] += max(requests_delta, 0)
-        entry["tokens_saved"] += max(tokens_saved_delta, 0)
-        entry["compression_savings_usd"] = round(
-            entry["compression_savings_usd"] + savings_usd_delta, 6
+        _accumulate_entry(
+            entry,
+            timestamp_dt=timestamp_dt,
+            requests_delta=requests_delta,
+            tokens_saved_delta=tokens_saved_delta,
+            savings_usd_delta=savings_usd_delta,
+            input_tokens_delta=input_tokens_delta,
+            input_cost_usd_delta=input_cost_usd_delta,
+            request_savings_percent=request_savings_percent,
         )
-        entry["total_input_tokens"] += max(input_tokens_delta, 0)
-        entry["total_input_cost_usd"] = round(
-            entry["total_input_cost_usd"] + max(input_cost_usd_delta, 0.0), 6
-        )
-        entry["last_activity_at"] = _to_utc_iso(timestamp_dt)
         if len(projects) > DEFAULT_MAX_PROJECTS:
             evict = min(
                 (key for key in projects if key != name),
@@ -1582,6 +1658,7 @@ class SavingsTracker:
         savings_usd_delta: float = 0.0,
         input_tokens_delta: int = 0,
         input_cost_usd_delta: float = 0.0,
+        request_savings_percent: float = 0.0,
     ) -> None:
         """Accumulate per-session savings. Caller must hold ``self._lock``.
 
@@ -1602,16 +1679,16 @@ class SavingsTracker:
         ]:
             del sessions[idle_key]
         entry = sessions.setdefault(key, _empty_session_entry())
-        entry["requests"] += max(requests_delta, 0)
-        entry["tokens_saved"] += max(tokens_saved_delta, 0)
-        entry["compression_savings_usd"] = round(
-            entry["compression_savings_usd"] + savings_usd_delta, 6
+        _accumulate_entry(
+            entry,
+            timestamp_dt=timestamp_dt,
+            requests_delta=requests_delta,
+            tokens_saved_delta=tokens_saved_delta,
+            savings_usd_delta=savings_usd_delta,
+            input_tokens_delta=input_tokens_delta,
+            input_cost_usd_delta=input_cost_usd_delta,
+            request_savings_percent=request_savings_percent,
         )
-        entry["total_input_tokens"] += max(input_tokens_delta, 0)
-        entry["total_input_cost_usd"] = round(
-            entry["total_input_cost_usd"] + max(input_cost_usd_delta, 0.0), 6
-        )
-        entry["last_activity_at"] = _to_utc_iso(timestamp_dt)
         if len(sessions) > DEFAULT_MAX_SESSIONS:
             # Evict the least recently active session, not the smallest saver: sessions are a recency-scoped index (an operator asks "what did this run save"), so recency is the only honest eviction order. String compare on the ISO activity stamp is a time compare.
             evict = min(
@@ -1660,13 +1737,7 @@ class SavingsTracker:
         )
         result: dict[str, dict[str, Any]] = {}
         for name, entry in ranked:
-            view = dict(entry)
-            total_before = entry["tokens_saved"] + entry["total_input_tokens"]
-            view["savings_percent"] = round(
-                (entry["tokens_saved"] / total_before * 100) if total_before > 0 else 0.0,
-                2,
-            )
-            result[name] = view
+            result[name] = _entry_view(entry)
         return result
 
     def _sessions_snapshot_locked(self) -> dict[str, dict[str, Any]]:
@@ -1679,13 +1750,7 @@ class SavingsTracker:
         )
         result: dict[str, dict[str, Any]] = {}
         for session_id, entry in ranked:
-            view = dict(entry)
-            total_before = entry["tokens_saved"] + entry["total_input_tokens"]
-            view["savings_percent"] = round(
-                (entry["tokens_saved"] / total_before * 100) if total_before > 0 else 0.0,
-                2,
-            )
-            result[session_id] = view
+            result[session_id] = _entry_view(entry)
         return result
 
     def session_response(self, session_id: str) -> dict[str, Any] | None:
@@ -1700,13 +1765,7 @@ class SavingsTracker:
             entry = self._state.get("sessions", {}).get(key)
             if not isinstance(entry, dict):
                 return None
-            view = dict(entry)
-            total_before = entry["tokens_saved"] + entry["total_input_tokens"]
-            view["savings_percent"] = round(
-                (entry["tokens_saved"] / total_before * 100) if total_before > 0 else 0.0,
-                2,
-            )
-            return view
+            return _entry_view(entry)
 
     def _by_model_snapshot_locked(self) -> dict[str, dict[str, Any]]:
         """Per-model stats ranked by savings."""
