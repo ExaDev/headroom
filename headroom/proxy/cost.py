@@ -185,7 +185,7 @@ def _summarize_transforms(transforms: list[str]) -> str:
 def header_safe_transforms(transforms: list[str]) -> list[str]:
     """Strip enriched detail so each tag is safe in the comma-joined header.
 
-    ``x-headroom-transforms`` is built as ``",".join(transforms_applied)``, so a
+    ``x-headroom-transforms`` is a comma-joined list (see ``transforms_header_value``), so a
     tag must not itself contain a comma or the header can't be split back into
     tags. The enriched ``read_lifecycle:<state>:<path>`` and
     ``smart_crush:<n>:<names>`` tags carry comma-bearing detail (file paths may
@@ -205,6 +205,44 @@ def header_safe_transforms(transforms: list[str]) -> list[str]:
         else:
             safe.append(t)
     return safe
+
+
+# Byte budget for the ``x-headroom-transforms`` response header value. Clients and intermediaries cap the
+# whole response header block (Node's default is 16 KiB, common servers and proxies 8 KiB), and the block
+# also carries the upstream passthrough headers and the other ``x-headroom-*`` values, so this one header
+# takes at most half of the smallest common limit. The transform list grows with the request (one tag per
+# message block before repeats collapse), so without a bound a long conversation overflows the client's
+# parser and the whole response is rejected.
+TRANSFORMS_HEADER_MAX_BYTES = 4096
+
+
+def transforms_header_value(transforms: list[str]) -> str:
+    """Build the ``x-headroom-transforms`` value: comma-free tags, repeats counted, bounded in bytes.
+
+    Each tag goes through ``header_safe_transforms``. A tag seen more than once appears once, at its first
+    position, as ``tag*N`` (the counter shape ``_summarize_transforms`` already uses). If the result still
+    exceeds ``TRANSFORMS_HEADER_MAX_BYTES``, the longest prefix of whole tags that fits is kept and a final
+    ``truncated:<n>`` token states how many tags were left out, so a reader can tell the list is partial.
+    The structured ``transforms_applied`` list keeps every tag for dashboards and request logs.
+    """
+    counts: dict[str, int] = {}
+    for tag in header_safe_transforms(transforms):
+        counts[tag] = counts.get(tag, 0) + 1
+    tokens = [f"{tag}*{n}" if n > 1 else tag for tag, n in counts.items()]
+    value = ",".join(tokens)
+    if len(value.encode()) <= TRANSFORMS_HEADER_MAX_BYTES:
+        return value
+    # The marker's width is bounded by the count of all tokens, which is at least the count left out.
+    reserve = len(f",truncated:{len(tokens)}")
+    kept: list[str] = []
+    size = 0
+    for token in tokens:
+        added = len(token.encode()) + (1 if kept else 0)
+        if size + added + reserve > TRANSFORMS_HEADER_MAX_BYTES:
+            break
+        kept.append(token)
+        size += added
+    return ",".join([*kept, f"truncated:{len(tokens) - len(kept)}"])
 
 
 def build_prefix_cache_stats(
