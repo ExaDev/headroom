@@ -99,7 +99,7 @@ from headroom.proxy.buffered_ccr_response import (
     buffered_ccr_asgi_call,
 )
 from headroom.proxy.compression_decision import CompressionDecision
-from headroom.proxy.cost import header_safe_transforms
+from headroom.proxy.cost import transforms_header_value
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
 from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.outcome import RequestOutcome
@@ -5419,8 +5419,8 @@ class OpenAIHandlerMixin:
                 response_headers["x-headroom-tokens-saved"] = str(tokens_saved)
                 response_headers["x-headroom-model"] = model
                 if transforms_applied:
-                    response_headers["x-headroom-transforms"] = ",".join(
-                        header_safe_transforms(transforms_applied)
+                    response_headers["x-headroom-transforms"] = transforms_header_value(
+                        transforms_applied
                     )
                 if cache_read_tokens > 0:
                     response_headers["x-headroom-cached"] = "true"

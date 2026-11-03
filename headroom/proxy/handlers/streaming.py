@@ -1597,11 +1597,9 @@ class StreamingMixin:
         forwarded_headers["x-headroom-tokens-saved"] = str(tokens_saved)
         forwarded_headers["x-headroom-model"] = model
         if transforms_applied:
-            from headroom.proxy.cost import header_safe_transforms
+            from headroom.proxy.cost import transforms_header_value
 
-            forwarded_headers["x-headroom-transforms"] = ",".join(
-                header_safe_transforms(transforms_applied)
-            )
+            forwarded_headers["x-headroom-transforms"] = transforms_header_value(transforms_applied)
 
         async def generate():
             nonlocal body, memory_enabled  # May need to modify for continuation requests
